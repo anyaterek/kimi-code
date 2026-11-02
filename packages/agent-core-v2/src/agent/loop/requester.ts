@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { defineState } from '#/state/state';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { countMediaParts } from '#human/llm/builtin/policy/media-degrade';
 import {
   createRecoveryLedger,
+  type LlmRecovery,
   type LlmRecoveryLedger,
   type LlmRecoveryRecord,
 } from '#human/llm/policy/recovery';
@@ -20,6 +20,7 @@ import {
   APIStatusError,
   classifyApiError,
   errorDiagnostics,
+  errorFromLlmMessage,
   isRetryableGenerateError,
 } from '#/llm-adapter/contract/errors';
 import { type ThinkingEffort } from '#human/llm-requester/thinking';
@@ -33,6 +34,7 @@ import {
   generateModel,
   type InitializedLlmRequester,
   type ModelRequestEvent,
+  type ModelRequestInput,
   type ModelRequestParams,
   type ModelRequestTiming,
 } from '#/llm-adapter/model/generate';
@@ -56,6 +58,8 @@ import {
   type AgentLLMRequestPartHandler,
   type AgentLLMRequestSource,
   type AgentLLMRequestTask,
+  type CoreLoopRequester,
+  type CoreLoopRequesterOptions,
   type PreparedTurnRequestConfig,
 } from './requesterContract';
 import type { LLMRequestTrace } from '#/llm-adapter/contract/request-trace';
@@ -73,7 +77,7 @@ import {
   hasStrictStructureRecovery,
 } from './projectionPolicy';
 import { createToolSelectResolver } from './toolSelectPolicy';
-import type { AgentMediaPolicyFactory } from './mediaPolicy';
+import type { AgentMediaPolicy, AgentMediaPolicyFactory } from './mediaPolicy';
 import { isAbortError } from '#/_base/utils/abort';
 import { parseBooleanEnv } from '#/_base/utils/env';
 import { ErrorCodes, Error2, unwrapErrorCause } from '#/errors';
@@ -84,6 +88,18 @@ import {
   sleepForRetry,
 } from '#/_base/utils/retry';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
+import {
+  contentsOf,
+  mergeFields,
+  requesterContents,
+  type LlmDimension,
+  type LlmRequestPart,
+  type LlmRequestRest,
+} from '#human/llm/requester';
+import type { LlmRequest as CoreLlmRequest } from '#human/llm/request';
+import type { LlmPolicy, LlmRunControl } from '#human/llm/policy/policy';
+import type { LlmOutcome, LlmRunEvent } from '#human/llm/response';
+import { LOOP_CONTROL_SECTION, type LoopControl } from './configSection';
 
 const noopOnPart: AgentLLMRequestPartHandler = () => {};
 
@@ -149,6 +165,20 @@ interface TurnRequestConfig {
   readonly systemPrompt: string;
 }
 
+type CoreRequestRest = LlmRequestRest<LlmDimension>;
+type Fields = Readonly<Record<string, unknown>>;
+
+interface PreparedCoreRequest {
+  readonly resolved: ResolvedLLMRequest;
+  readonly mediaPolicy?: AgentMediaPolicy;
+  readonly request: CoreLlmRequest;
+}
+
+interface AttemptObservation {
+  previousMediaCount?: number;
+  previousMediaRecovery?: LlmRecoveryRecord;
+}
+
 export const llmRequesterLastConfigLogSignatureKey = defineState<string | undefined>(
   'llmRequester.lastConfigLogSignature',
   () => undefined as string | undefined,
@@ -178,9 +208,10 @@ export const llmRequesterEmittedThinkingEffortWarningsKey = defineState<Set<stri
 export class AgentLoopRequester implements LoopRequester {
   private readonly projector: AgentLoopProjector;
   private mediaPolicyFactory: AgentMediaPolicyFactory | undefined;
+  private contextMessages: () => readonly Message[] = () => [];
+  private contextRevision: () => number = () => 0;
 
   constructor(
-    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
     @ISessionTokenCountingService private readonly tokenCounting: ISessionTokenCountingService,
     @IAgentToolSelectService private readonly toolSelect: IAgentToolSelectService,
     @IAgentProfileService private readonly profile: IAgentProfileService,
@@ -207,6 +238,332 @@ export class AgentLoopRequester implements LoopRequester {
 
   registerMediaPolicy(factory: AgentMediaPolicyFactory): void {
     this.mediaPolicyFactory = factory;
+  }
+
+  bindHistory(messages: () => readonly Message[], revision: () => number): void {
+    this.contextMessages = messages;
+    this.contextRevision = revision;
+  }
+
+  coreRequester(options: CoreLoopRequesterOptions): CoreLoopRequester {
+    const accumulate = (part: LlmRequestPart): CoreLoopRequester => ({
+      [requesterContents]: part,
+      with: ((next: LlmRequestPart | CoreLoopRequester) =>
+        accumulate(mergeFields(part as Fields, contentsOf(next) as Fields) as LlmRequestPart)) as CoreLoopRequester['with'],
+      request: (rest) => this.prepareCoreRequest(options, part, rest).request,
+      generate: (rest, control) => this.generateCoreRequest(options, part, rest, control),
+    });
+    return accumulate({});
+  }
+
+  private prepareCoreRequest(
+    options: CoreLoopRequesterOptions,
+    part: LlmRequestPart,
+    rest: CoreRequestRest,
+    source = options.source(),
+  ): PreparedCoreRequest {
+    const resolved = this.resolveRequest({
+      source,
+      messages: rest.content?.messages,
+      systemPrompt: rest.profile?.systemPrompt,
+      tools: undefined,
+      usedContextTokens: rest.content?.usedTokens,
+    });
+    const mediaPolicy = this.mediaPolicyFactory?.(resolved.model, resolved.request);
+    const hostPolicy = this.corePolicy(resolved, mediaPolicy);
+    const extraPolicy = mergeFields(part.policy as Fields | undefined, rest.policy as Fields | undefined) as
+      | LlmPolicy
+      | undefined;
+    const base = mergeFields(contentsOf(resolved.request) as Fields, {
+      profile: { systemPrompt: resolved.systemPrompt, tools: resolved.tools },
+      content: { messages: resolved.messages, usedTokens: resolved.params.usedContextTokens },
+    } as Fields);
+    const request = mergeFields(mergeFields(base, part as Fields), rest as Fields) as unknown as CoreLlmRequest;
+    return {
+      resolved,
+      mediaPolicy,
+      request: {
+        ...request,
+        profile: { ...request.profile, tools: resolved.tools },
+        policy: mergeCorePolicies(hostPolicy, extraPolicy),
+      },
+    };
+  }
+
+  private corePolicy(request: ResolvedLLMRequest, mediaPolicy: AgentMediaPolicy | undefined): LlmPolicy {
+    return {
+      retry: {
+        maxAttemptsPerStep: this.config.get<LoopControl>(LOOP_CONTROL_SECTION)?.maxAttemptsPerStep,
+        infiniteRetry: this.infiniteRetryEnabled,
+      },
+      recoveries: [
+        coreCredentialRecovery,
+        createStructureRecovery(this.projector),
+        ...(mediaPolicy === undefined ? [] : [mediaPolicy.recovery]),
+      ],
+      resolvers: [
+        createToolSelectResolver(this.toolSelect),
+        ...(mediaPolicy === undefined ? [] : [mediaPolicy.toolResolver]),
+        createStructureResolver(this.projector),
+        ...(mediaPolicy === undefined ? [] : [mediaPolicy.resolver]),
+      ],
+    };
+  }
+
+  private async generateCoreRequest(
+    options: CoreLoopRequesterOptions,
+    part: LlmRequestPart,
+    rest: CoreRequestRest,
+    control: LlmRunControl,
+  ): Promise<LlmOutcome> {
+    const source = options.source();
+    const trace = new MutableLLMRequestTrace();
+    const startedAt = Date.now();
+    options.onTrace?.(trace);
+    const setRequestId = (requestId: string | null | undefined): void => {
+      trace.set(requestId ?? undefined);
+      this.telemetry.setContext({ request_id: requestId ?? undefined });
+    };
+    setRequestId(undefined);
+    try {
+      const prepared = this.prepareCoreRequest(options, part, rest, source);
+      const { resolved, mediaPolicy, request } = prepared;
+      const recoveredMedia = this.recoveredMedia(resolved);
+      const recoveryLedger =
+        control.recoveries ??
+        (recoveredMedia === undefined
+          ? createRecoveryLedger()
+          : mediaPolicy === undefined
+            ? recoveredMedia.fork()
+            : await mediaPolicy.refreshRecovery(recoveredMedia, resolved.messages));
+      const observation: AttemptObservation = {};
+      let recorded: RecordedRequestSnapshot | undefined;
+      const outcome = await resolved.request.with({
+        protocol: request.protocol,
+        endpoint: request.endpoint,
+        model: request.model,
+        content: request.content,
+        profile: request.profile,
+        policy: request.policy,
+      }).generate(
+        {},
+        {
+          signal: control.signal,
+          recoveries: recoveryLedger,
+          onAttempt: (attemptRequest) => {
+            setRequestId(undefined);
+            recorded = this.recordAttempt(
+              resolved,
+              recoveryLedger,
+              {
+                systemPrompt: attemptRequest.profile?.systemPrompt ?? resolved.systemPrompt,
+                tools: attemptRequest.profile?.tools,
+                messages: attemptRequest.content.messages,
+              },
+              attemptRequest,
+              observation,
+            );
+          },
+          onEvent: (event) => {
+            if (event.type === 'llm.streaming.headers') {
+              setRequestId(request.protocol.base.requestId?.(event.headers));
+            } else if (event.type === 'llm.retrying') {
+              if (event.reason === 'recovery') this.reportRecovery(resolved, event, recoveryLedger);
+              if (event.reason === 'backoff' && this.infiniteRetryEnabled) {
+                this.log.warn('llm request failed; retrying indefinitely (KIMI_CODE_INFINITE_RETRY)', {
+                  model: resolved.model.name,
+                  ...resolved.logFields,
+                  attempt: event.failedAttempt,
+                  delayMs: event.delayMs,
+                  ...retryErrorFields(event.error),
+                });
+              }
+            }
+            if (event.type === 'llm.ended' && event.outcome.type === 'done') {
+              options.onOutcome?.(event.outcome);
+            }
+            control.onEvent?.(event);
+          },
+        },
+      );
+      if (outcome.type === 'done') {
+        setRequestId(outcome.requestId);
+        this.completeRequest(resolved, recorded, {
+          message: outcome.message,
+          usage: outcome.usage,
+          timing: outcome.timing,
+          requestId: outcome.requestId,
+          startedAt,
+        });
+      } else if (outcome.type === 'failed') {
+        const classified = outcome.error.kind === 'auth' ? { ...outcome.error, kind: 'status' as const } : outcome.error;
+        const error =
+          outcome.rawError ??
+          errorFromLlmMessage(classified as Parameters<typeof errorFromLlmMessage>[0], outcome.diagnostics);
+        this.logRequestFailure(error, { source }, control.signal);
+        this.trackApiError(error, startedAt, control.signal, source);
+        setRequestId(undefined);
+      } else {
+        setRequestId(undefined);
+      }
+      return outcome;
+    } catch (error) {
+      this.logRequestFailure(error, { source }, control.signal);
+      this.trackApiError(error, startedAt, control.signal, source);
+      setRequestId(undefined);
+      throw error;
+    }
+  }
+
+  private recordAttempt(
+    request: ResolvedLLMRequest,
+    recoveryLedger: LlmRecoveryLedger,
+    attemptInput: ModelRequestInput,
+    attemptRequest: CoreLlmRequest,
+    observation: AttemptObservation,
+  ): RecordedRequestSnapshot {
+    const mediaRecovery = latestMediaRecovery(recoveryLedger.applied);
+    const projection = projectionNameOf(recoveryLedger.applied, mediaRecovery);
+    const fields = projection === undefined ? request.logFields : { ...request.logFields, projection };
+    const currentMediaCount = countMediaParts(attemptInput.messages);
+    const mediaPolicyChanged =
+      observation.previousMediaCount !== undefined && observation.previousMediaRecovery !== mediaRecovery;
+    const droppedMediaCount =
+      observation.previousMediaCount === undefined ? 0 : observation.previousMediaCount - currentMediaCount;
+    observation.previousMediaCount = currentMediaCount;
+    observation.previousMediaRecovery = mediaRecovery;
+    const mediaProjection =
+      mediaRecovery === undefined
+        ? undefined
+        : mediaRecovery.action === 'degraded'
+          ? 'media-degraded'
+          : 'media-stripped';
+    if (mediaPolicyChanged && droppedMediaCount > 0 && mediaProjection !== undefined) {
+      try {
+        void this.dispatcher.dispatch(
+          new WarningIssued({
+            agentId: this.scopeContext.agentId,
+            code: mediaProjection,
+            message:
+              mediaProjection === 'media-degraded'
+                ? 'Provider rejected the request as too large; older media were dropped and the request was retried.'
+                : 'Provider rejected the media in the request; all media were omitted and the request was retried.',
+          }),
+        );
+      } catch {
+      }
+    }
+    this.warnAboutAnthropicThinkingEffort(request);
+    const logInput: LLMRequestLogInput = {
+      protocol: request.model.protocol,
+      providerType: request.model.providerType,
+      modelName: request.model.name,
+      modelAlias: request.modelAlias,
+      thinkingEffort: request.thinkingEffort,
+      maxTokens: effectiveMaxCompletionTokens(request.params),
+      systemPrompt: attemptInput.systemPrompt,
+      tools: attemptInput.tools ?? [],
+      toolSelect: this.toolSelect.enabled(
+        withProtocolCapabilities(attemptRequest.model.spec, attemptRequest.protocol.base).capability ?? {},
+      ),
+      messages: attemptInput.messages,
+      fields,
+    };
+    this.logRequest(logInput);
+    return this.recordRequest(logInput);
+  }
+
+  private reportRecovery(
+    request: ResolvedLLMRequest,
+    recovery: Extract<LlmRunEvent, { reason: 'recovery' }>,
+    recoveryLedger: LlmRecoveryLedger,
+    onAttemptRetry?: () => void,
+  ): void {
+    if (recovery.strategy === 'structure') {
+      this.log.warn('provider rejected request structure; resending with strict projection', {
+        model: request.model.name,
+        ...request.logFields,
+      });
+      this.telemetry.track2('llm_request_projection_fallback', {
+        projection: 'strict',
+        error_type: recovery.error.kind,
+        model: request.model.id,
+        turn_id: request.source?.turnId,
+      });
+      onAttemptRetry?.();
+      return;
+    }
+    if (recovery.strategy !== 'media-degrade') return;
+    this.markMediaRecovery(request, recoveryLedger);
+    const degraded = recovery.action === 'degraded';
+    this.log.warn(
+      degraded
+        ? 'provider rejected request as too large; resending with degraded media'
+        : recovery.error.kind === 'request_too_large'
+          ? 'provider rejected request as too large; resending with rejected media stripped'
+          : 'provider rejected an image in the request; resending with rejected media stripped',
+      {
+        model: request.model.name,
+        ...request.logFields,
+      },
+    );
+    this.telemetry.track2('llm_request_projection_fallback', {
+      projection: degraded ? 'media-degraded' : 'media-stripped',
+      error_type: recovery.error.kind,
+      model: request.model.id,
+      turn_id: request.source?.turnId,
+    });
+    onAttemptRetry?.();
+  }
+
+  private completeRequest(
+    request: ResolvedLLMRequest,
+    recorded: RecordedRequestSnapshot | undefined,
+    input: {
+      readonly message: AgentLLMRequestFinish['message'];
+      readonly usage?: TokenUsage;
+      readonly timing?: ModelRequestTiming;
+      readonly requestId?: string;
+      readonly startedAt: number;
+    },
+  ): void {
+    const { message, usage, timing, requestId, startedAt } = input;
+    if (request.promptCacheProbe === 'compaction') {
+      this.telemetry.track2('prompt_cache_probe', {
+        source: 'compaction',
+        turn_id: request.source?.turnId,
+        provider_type: request.model.providerType ?? request.model.protocol,
+        protocol: request.model.protocol,
+        ...cacheProbeUsage(usage),
+      });
+    }
+    const inputTokens = usage === undefined ? undefined : inputTotal(usage);
+    if (recorded !== undefined && usage !== undefined && inputTokens !== undefined && inputTokens + usage.output > 0) {
+      const measured: MeasuredRequest = {
+        modelAlias: request.modelAlias,
+        contextRevision: request.contextRevision,
+        toolsHash: recorded.toolsHash,
+        systemPromptHash: recorded.systemPromptHash,
+        messageCount: recorded.messageCount,
+        historyHash: recorded.historyHash,
+        inputTokens,
+        startedAt,
+        finishedAt: Date.now(),
+        thinkingEffort: request.thinkingEffort,
+        requestKind: requestKindForTelemetry(request.source),
+        turnId: request.source?.turnId,
+        step: request.source?.type === 'turn' ? request.source.step : undefined,
+        traceId: requestId,
+        usage,
+      };
+      this.trackCacheBreak(measured, recorded.messages);
+      this.states.set(llmRequesterLastMeasuredRequestKey, measured);
+    }
+    void this.usage.record(this.scopeContext.agentContext, request.modelAlias, usage, request.source);
+    if (usage !== undefined) {
+      this.tokenCounting.measured(this.scopeContext.agentContext, request.messages, [message], usage);
+    }
+    this.logResponse(request.logFields, usage ?? emptyUsage(), timing);
   }
 
   private get lastConfigLogSignature(): string | undefined {
@@ -751,7 +1108,7 @@ export class AgentLoopRequester implements LoopRequester {
       ...(optedOut ? { maxCompletionTokens: maxCompletionTokensCap } : {}),
     };
 
-    const messages = overrides.messages ?? this.context.get();
+    const messages = overrides.messages ?? this.contextMessages();
     return {
       request: this.protocolRegistry.request(model, params),
       model,
@@ -761,7 +1118,7 @@ export class AgentLoopRequester implements LoopRequester {
       systemPrompt: overrides.systemPrompt ?? turnConfig?.systemPrompt ?? this.profile.getSystemPrompt(),
       tools: overrides.tools === undefined ? undefined : [...overrides.tools],
       messages: [...messages],
-      contextRevision: this.context.prefixRevision(),
+      contextRevision: this.contextRevision(),
       promptCacheProbe: overrides.promptCacheProbe,
       source: overrides.source,
       logFields: logFieldsForSource(overrides.source),
@@ -987,6 +1344,43 @@ function projectionField(fields: AgentLLMRequestLogFields): LlmRequestProjection
       return undefined;
   }
 }
+
+type PolicyList<T> = readonly T[] | (() => readonly T[]) | undefined;
+
+function policyList<T>(value: PolicyList<T>): readonly T[] {
+  return typeof value === 'function' ? value() : (value ?? []);
+}
+
+function mergePolicyLists<T>(host: PolicyList<T>, extra: PolicyList<T>): () => readonly T[] {
+  return () => [...policyList(host), ...policyList(extra)];
+}
+
+function mergeCorePolicies(host: LlmPolicy, extra: LlmPolicy | undefined): LlmPolicy {
+  if (extra === undefined) return host;
+  return {
+    retry: extra.retry === undefined ? host.retry : { ...host.retry, ...extra.retry },
+    recoveries: mergePolicyLists(host.recoveries, extra.recoveries),
+    resolvers: mergePolicyLists(host.resolvers, extra.resolvers),
+    retryables: mergePolicyLists(host.retryables, extra.retryables),
+  };
+}
+
+const coreCredentialRecovery: LlmRecovery = {
+  propose: ({ error, appliedRecoveries, endpoint }) => {
+    const provider = endpoint?.credentials;
+    if (
+      provider?.canRecover?.(error) !== true ||
+      appliedRecoveries.some((record) => record.strategy === 'credentials')
+    ) {
+      return undefined;
+    }
+    return {
+      strategy: 'credentials',
+      action: 'refresh',
+      beforeNextAttempt: () => provider.invalidate?.(),
+    };
+  },
+};
 
 function fingerprint(content: string): string {
   return createHash('sha256').update(content).digest('hex');

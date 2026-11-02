@@ -4,24 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DisposableStore, toDisposable } from '#/_base/di/lifecycle';
 import { TestInstantiationService } from '#/_base/di/test';
 import type { AgentContext } from '#/agent/agentContext/agentContext';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage } from '#/agent/contextMemory/types';
 import { AgentLoopRequester, KIMI_CODE_INFINITE_RETRY_ENV } from '#/agent/loop/requester';
+import { LOOP_CONTROL_SECTION } from '#/agent/loop/configSection';
 import { createAgentMediaPolicy } from '#/agent/loop/mediaPolicy';
-import { createMachineRequester } from '#/agent/loop/machine/requester';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
-import {
-  createTurnMachine,
-  type AssistantEntry,
-  type TurnEvent,
-  type TurnInput,
-  type TurnLlmEvent,
-} from '#human/agent/turn';
-import { UNKNOWN_CAPABILITY } from '#human/llm-requester/capability';
-import { createOpenAIRequester } from '#human/llm-requester/factories';
-import type { LlmModel } from '#human/llm-requester/model';
-import type { LlmRequester } from '#human/llm-requester/requester';
-import { createActor, emit, setup } from '#human/xstate2';
 import { ISessionTokenCountingService } from '#/session/tokenCounting/sessionTokenCounting';
 import { IAgentProfileService } from '#/agent/profile/profile';
 import { IAgentStateService } from '#/agent/state/agentState';
@@ -51,6 +38,7 @@ import {
   type ToolCall,
 } from '#human/llm/message';
 import { mediaUrlOf } from '#human/llm/protocol/kit/media';
+import type { LlmRequest as CoreLlmRequest } from '#human/llm/request';
 import type { ThinkingEffort } from '#human/llm-requester/thinking';
 import type { ModelCapability } from '#/llm-adapter/contract/capability';
 import { IModelCatalog, type Model } from '#/llm-adapter/model/catalog';
@@ -80,43 +68,6 @@ import {
   registerTestAgentWire,
   registerTestEventDispatcher,
 } from '../../wire/stubs';
-
-const turnHarnessModel: LlmModel = {
-  provider: 'test',
-  model: 'test-model',
-  capability: UNKNOWN_CAPABILITY,
-};
-
-function createTurnHarness(requester: LlmRequester) {
-  return setup({
-    types: {
-      input: {} as TurnInput,
-      context: {} as { turnInput: TurnInput },
-      events: {} as TurnEvent,
-      emitted: {} as TurnLlmEvent,
-    },
-    actors: { turn: createTurnMachine(requester) },
-  }).createMachine({
-    id: 'turn-harness',
-    initial: 'running',
-    context: ({ input }) => ({ turnInput: input }),
-    states: {
-      running: {
-        invoke: {
-          src: 'turn',
-          input: ({ context }) => context.turnInput,
-          onDone: { target: 'completed' },
-        },
-        on: {
-          '*': {
-            actions: emit(({ event }) => event as TurnLlmEvent),
-          },
-        },
-      },
-      completed: { type: 'final' },
-    },
-  });
-}
 
 const capabilities: ModelCapability = {
   image_in: false,
@@ -191,6 +142,9 @@ function createService(
     readonly env?: Record<string, string>;
     readonly modelAlias?: () => string;
     readonly prefixRevision?: () => number;
+    readonly systemPrompt?: () => string;
+    readonly requestParams?: () => ReturnType<IAgentProfileService['resolveRequestParams']>;
+    readonly maxAttemptsPerStep?: number;
   } = {},
 ) {
   const ix = disposables.add(new TestInstantiationService());
@@ -208,14 +162,14 @@ function createService(
       compactionTriggerRatio: undefined,
       compactionMaxAttempts: undefined,
     }),
-    resolveRequestParams: () => ({}),
-    getSystemPrompt: () => 'system',
+    resolveRequestParams: () => options.requestParams?.() ?? {},
+    getSystemPrompt: () => options.systemPrompt?.() ?? 'system',
     data: () => ({
       cwd: '',
       modelAlias: 'm',
       modelCapabilities: capabilities,
       thinkingLevel,
-      systemPrompt: 'system',
+      systemPrompt: options.systemPrompt?.() ?? 'system',
     }),
   };
   const measuredCalls: { readonly messages: number; readonly usage: TokenUsage }[] = [];
@@ -236,7 +190,10 @@ function createService(
     prefixRevision: options.prefixRevision ?? (() => 0),
   };
   const config: Partial<IConfigService> = {
-    get: (() => undefined) as IConfigService['get'],
+    get: ((section: string) =>
+      section === LOOP_CONTROL_SECTION
+        ? { maxAttemptsPerStep: options.maxAttemptsPerStep }
+        : undefined) as IConfigService['get'],
   };
   const log = { info: () => undefined, warn: () => undefined };
   const telemetryRecords: TelemetryRecord[] = [];
@@ -261,7 +218,6 @@ function createService(
     displayPaths: async () => new Map(),
     ...options.mediaResolver,
   };
-  ix.stub(IAgentContextMemoryService, context);
   ix.stub(IAgentToolSelectService, toolSelect);
   ix.stub(IAgentMediaResolverService, mediaResolver);
   ix.stub(ISessionTokenCountingService, tokenCounting);
@@ -297,6 +253,7 @@ function createService(
   registerTestEventDispatcher(ix);
   ix.set(IAgentStateService, new AgentStateService());
   const service = ix.createInstance(AgentLoopRequester);
+  service.bindHistory(() => context.get(), () => context.prefixRevision());
   service.registerMediaPolicy((model, request) =>
     createAgentMediaPolicy(mediaResolver, model, request),
   );
@@ -1819,52 +1776,6 @@ function createScriptedRequester(
   };
 }
 
-function createOpenAIModelEventRequester(ids: readonly string[]): ModelEventRequester {
-  const base = createRequester({ value: 0 });
-  const requester = createOpenAIRequester({
-    clientFactory: () => ({
-      chat: {
-        completions: {
-          create: () => ({
-            withResponse: async () => ({
-              data: (async function* () {
-                yield {
-                  id: 'chatcmpl-1',
-                  object: 'chat.completion.chunk',
-                  created: 0,
-                  model: 'test-model',
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        tool_calls: ids.map((id, index) => ({
-                          index,
-                          id,
-                          type: 'function',
-                          function: { name: 'Bash', arguments: '{"command":"ls"}' },
-                        })),
-                      },
-                      finish_reason: 'tool_calls',
-                    },
-                  ],
-                };
-              })(),
-              response: new Response(null),
-            }),
-          }),
-        },
-      },
-    }) as never,
-  });
-  const model = { ...base.model, protocol: 'openai' as const };
-  const registry = new ProtocolAdapterRegistry();
-  return {
-    model,
-    request: (input, signal, params) =>
-      generateModel(coreRequesterFromA(registry.request(model, params), requester), input, signal, params),
-  };
-}
-
 describe('AgentLoopRequester tool call id forwarding', () => {
   it('passes lower-layer unique ids through unchanged', async () => {
     const parts: StreamedMessagePart[] = [];
@@ -1878,34 +1789,6 @@ describe('AgentLoopRequester tool call id forwarding', () => {
 
     expect(result.message.toolCalls.map((c) => c.id)).toEqual(['call_1', 'call_2']);
     expect(parts.filter(isToolCall).map((p) => p.id)).toEqual(['call_1', 'call_2']);
-  });
-
-  it('normalizes repeated provider ids in llm and forwards the result', async () => {
-    const parts: StreamedMessagePart[] = [];
-    const { service } = createService(createOpenAIModelEventRequester(['Bash_0']));
-
-    const first = await service.request({}, (part) => {
-      parts.push(part);
-    });
-    const second = await service.request(
-      {
-        messages: [
-          ...history,
-          first.message,
-          { role: 'tool', content: [{ type: 'text', text: 'done' }], toolCallId: 'Bash_0' },
-        ],
-      },
-      (part) => {
-        parts.push(part);
-      },
-    );
-
-    expect(first.message.toolCalls[0]!.id).toBe('Bash_0');
-    expect(second.message.toolCalls[0]).toMatchObject({ id: 'Bash_0__2', rawId: 'Bash_0' });
-    expect(parts.filter(isToolCall).map((p) => [p.id, p.rawId])).toEqual([
-      ['Bash_0', undefined],
-      ['Bash_0__2', 'Bash_0'],
-    ]);
   });
 
   it('preserves lower-layer duplicate id assignments', async () => {
@@ -2003,7 +1886,7 @@ describe('AgentLoopRequester attempt retry notification', () => {
   });
 });
 
-describe('turn machine stream state across service-internal retries', () => {
+describe('core requester stream state across service-internal retries', () => {
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -2017,20 +1900,187 @@ describe('turn machine stream state across service-internal retries', () => {
       ]),
       { env: { [KIMI_CODE_INFINITE_RETRY_ENV]: '1' } },
     );
-    const machineRequester = createMachineRequester(service);
-    const doneEntries: AssistantEntry[] = [];
-    const actor = createActor(createTurnHarness(machineRequester.requester), {
-      input: { request: { model: turnHarnessModel }, history: [] },
-    });
-    actor.on('llm.done', (event) => doneEntries.push(event.entry));
-    actor.start();
+    const outcomePromise = service.coreRequester({
+      source: () => ({ type: 'turn', turnId: 0, step: 0 }),
+    }).generate(
+      { content: { messages: [] }, profile: {} },
+      { signal: new AbortController().signal },
+    );
 
     await vi.runAllTimersAsync();
     for (let index = 0; index < 10; index += 1) {
       await vi.advanceTimersByTimeAsync(0);
     }
 
-    expect(doneEntries).toHaveLength(1);
-    expect(doneEntries[0]?.message.toolCalls.map((toolCall) => toolCall.id)).toEqual(['call_b']);
+    const outcome = await outcomePromise;
+    if (outcome.type !== 'done') throw new Error(`unexpected outcome: ${outcome.type}`);
+    expect(outcome.message.toolCalls.map((toolCall) => toolCall.id)).toEqual(['call_b']);
+  });
+});
+
+describe('core requester', () => {
+  async function generateCore(
+    service: AgentLoopRequester,
+    turnId: number,
+    step: number,
+    messages: readonly Message[] = history,
+    onEvent?: (event: { readonly type: string }) => void,
+  ) {
+    return service.coreRequester({ source: () => ({ type: 'turn', turnId, step }) }).generate(
+      { content: { messages }, profile: {} },
+      { signal: new AbortController().signal, onEvent },
+    );
+  }
+
+  it('freezes turn configuration, merges policies and retries only in core while side requests stay independent', async () => {
+    const calls = { value: 0 };
+    const requester = createRequester(calls, new APIConnectionError('terminated'));
+    const base = requester.request.bind(requester);
+    requester.request = async function* (input, signal, options) {
+      yield {
+        type: 'usage',
+        usage: { inputOther: 40, output: 2, inputCacheRead: 0, inputCacheCreation: 0 },
+        model: 'wire-model',
+      };
+      for await (const event of base(input, signal, options)) {
+        yield event.type === 'finish' ? { ...event, requestId: 'trace-core' } : event;
+      }
+    };
+    let systemPrompt = 'frozen-system';
+    let temperature = 0.1;
+    const seen: CoreLlmRequest[] = [];
+    const extraResolver = {
+      id: 'extra-resolver',
+      resolve: async (request: (typeof seen)[number]) => {
+        seen.push(request);
+        return request;
+      },
+    };
+    const prepareForRequest = vi.fn(async () => {});
+    const { service, dispatcher, records, measuredCalls } = createService(
+      { ...requester, model: { ...requester.model, protocol: 'openai' } },
+      {
+        env: { [KIMI_CODE_INFINITE_RETRY_ENV]: '1' },
+        maxAttemptsPerStep: 1,
+        systemPrompt: () => systemPrompt,
+        requestParams: () => ({ sampling: { temperature } }),
+        toolSelect: { prepareForRequest },
+      },
+    );
+    service.prepareTurnConfig(7);
+    systemPrompt = 'changed-system';
+    temperature = 0.9;
+    const trace: { current?: { requestId?: string } } = {};
+    const core = service.coreRequester({
+      source: () => ({ type: 'turn', turnId: 7, step: 2 }),
+      onTrace: (current) => {
+        trace.current = current;
+      },
+    }).with({ policy: { resolvers: [extraResolver] } });
+    const prepared = core.request({ content: { messages: history, usedTokens: 17 }, profile: {} });
+    expect(prepared.profile?.systemPrompt).toBe('frozen-system');
+    expect(prepared.model.sampling?.temperature).toBe(0.1);
+    expect(prepared.content.usedTokens).toBe(17);
+    expect(prepared.policy?.retry).toEqual({ maxAttemptsPerStep: 1, infiniteRetry: true });
+
+    const retries: string[] = [];
+    const outcome = await core.generate(
+      { content: { messages: history, usedTokens: 17 }, profile: {} },
+      {
+        signal: new AbortController().signal,
+        onEvent: (event) => {
+          if (event.type === 'llm.retrying') retries.push(event.reason);
+        },
+      },
+    );
+
+    expect(outcome.type).toBe('done');
+    expect(calls.value).toBe(2);
+    expect(retries).toEqual(['backoff']);
+    expect(prepareForRequest).toHaveBeenCalledTimes(2);
+    expect(seen).toHaveLength(2);
+    expect(seen.every((request) => request.profile?.systemPrompt === 'frozen-system')).toBe(true);
+    expect(seen.every((request) => request.model.sampling?.temperature === 0.1)).toBe(true);
+    expect(trace.current?.requestId).toBe('trace-core');
+    expect(measuredCalls).toHaveLength(1);
+    await dispatcher.flush();
+    expect(records.filter((record) => record.type === 'llm.request')).toHaveLength(2);
+
+    await service.request({ messages: history });
+    expect(calls.value).toBe(3);
+  });
+
+  it('recovers credentials through the core recovery policy', async () => {
+    const calls = { value: 0 };
+    const base = createRequester(calls, new APIStatusError(401, 'unauthorized'));
+    const invalidate = vi.fn();
+    const requester: ModelEventRequester = {
+      ...base,
+      model: {
+        ...base.model,
+        credentialProvider: {
+          resolve: () => ({ apiKey: 'test-key' }),
+          canRecover: () => true,
+          invalidate,
+        },
+      },
+    };
+    const { service, dispatcher, records } = createService(requester);
+
+    const outcome = await generateCore(service, 3, 1);
+
+    expect(outcome.type).toBe('done');
+    expect(calls.value).toBe(2);
+    expect(invalidate).toHaveBeenCalledTimes(1);
+    await dispatcher.flush();
+    expect(records.filter((record) => record.type === 'llm.request')).toHaveLength(2);
+  });
+
+  it('composes structure and media recovery with per-attempt wire projections', async () => {
+    const calls = { value: 0 };
+    const inputs: ModelRequestInput[] = [];
+    const messages: Message[] = [
+      { role: 'assistant', content: [{ type: 'text', text: 'stale' }], toolCalls: [] },
+      {
+        role: 'user',
+        content: ['ONE', 'TWO', 'THREE'].map((data) => ({
+          type: 'image_url',
+          imageUrl: { url: `data:image/png;base64,${data}` },
+        })),
+      },
+    ];
+    const { service, dispatcher, records } = createService(
+      createRequester(calls, new APIStatusError(400, 'tool_use ids must be unique'), [new APIRequestTooLargeError(413, 'too large')], inputs),
+      { contextMessages: messages },
+    );
+
+    const outcome = await generateCore(service, 4, 2, messages);
+
+    expect(outcome.type).toBe('done');
+    expect(calls.value).toBe(3);
+    await dispatcher.flush();
+    expect(records.filter((record) => record.type === 'llm.request').map((record) => record['projection'])).toEqual([
+      undefined,
+      'strict',
+      'strict-media-degraded',
+    ]);
+  });
+
+  it('keeps cache diagnostics and usage measurement on the successful core outcome', async () => {
+    const { service, telemetryRecords, measuredCalls } = createService(
+      createCacheRequester([cacheUsage(10000), cacheUsage(7000)]),
+    );
+
+    await generateCore(service, 5, 1);
+    await generateCore(service, 5, 2);
+
+    expect(measuredCalls).toHaveLength(2);
+    expect(cacheBreaks(telemetryRecords)).toHaveLength(1);
+    expect(cacheBreaks(telemetryRecords)[0]?.properties).toMatchObject({
+      request_kind: 'turn',
+      turn_id: 5,
+      step_no: 2,
+      trace_id: 'trace-2',
+    });
   });
 });

@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { IEventBus } from '#/app/event/eventBus';
 import { IFileService } from '#/app/file/fileService';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage, PromptOrigin } from '#/agent/contextMemory/types';
 import { IAgentLoopService, type PromptHandle } from '#/agent/loop/loop';
 import { TurnStarted } from '#/agent/loop/turnEvents';
@@ -307,8 +306,8 @@ describe('prompt queue', () => {
     await loop.settled();
     expect(events).toHaveLength(0);
     const merged = ctx
-      .get(IAgentContextMemoryService)
-      .get()
+      .get(IAgentLoopService)
+      .history()
       .find(
         (entry) =>
           entry.role === 'user' &&
@@ -342,8 +341,8 @@ describe('prompt queue', () => {
     await loop.settled();
     expect(events).toHaveLength(0);
     const merged = ctx
-      .get(IAgentContextMemoryService)
-      .get()
+      .get(IAgentLoopService)
+      .history()
       .find(
         (entry) =>
           entry.role === 'user' &&
@@ -408,8 +407,8 @@ describe('prompt queue', () => {
 
     expect(steerEvents).toHaveLength(0);
     const materializedStops = ctx
-      .get(IAgentContextMemoryService)
-      .get()
+      .get(IAgentLoopService)
+      .history()
       .filter(
         (entry) =>
           entry.role === 'user' &&
@@ -507,7 +506,7 @@ describe('prompt queue', () => {
     expect(loop.snapshot().queue).toHaveLength(0);
     await loop.settled();
 
-    const history = ctx.context.get();
+    const history = ctx.context.history();
     expect(history[0]?.role).toBe('user');
     expect(history[0]?.content).toEqual([
       {
@@ -546,7 +545,7 @@ describe('prompt queue', () => {
     });
     await expect(handle.completion).resolves.toMatchObject({ state: 'blocked' });
 
-    const history = ctx.context.get();
+    const history = ctx.context.history();
     expect(history).toHaveLength(1);
     expect(history[0]?.origin).toEqual({ kind: 'user' });
     expect(history[0]?.content).toEqual([
@@ -588,7 +587,7 @@ describe('prompt queue', () => {
     });
     await hold.started;
 
-    const appended = ctx.context.get();
+    const appended = ctx.context.history();
     expect(appended).toHaveLength(1);
     const parts = appended[0]!.content;
     expect(parts.some((part) => part.type === 'image_url')).toBe(false);
@@ -617,7 +616,7 @@ describe('prompt queue', () => {
     });
     await hold.started;
 
-    const parts = ctx.context.get()[0]!.content;
+    const parts = ctx.context.history()[0]!.content;
     expect(parts).toEqual([{ type: 'image_url', imageUrl: { url } }]);
 
     hold.release();
@@ -647,7 +646,7 @@ describe('prompt queue', () => {
     hold.release();
     await loop.settled();
 
-    const parts = ctx.context.get().flatMap((entry) => entry.content);
+    const parts = ctx.context.history().flatMap((entry) => entry.content);
     expect(parts.some((part) => part.type === 'image_url')).toBe(false);
     expect(
       parts.some((part) => part.type === 'text' && part.text.includes('image/avif')),
@@ -812,7 +811,7 @@ describe('prompt queue', () => {
     hold.release();
     await loop.settled();
 
-    const merged = ctx.context.get().find(
+    const merged = ctx.context.history().find(
       (entry) => entry.origin?.kind === 'user' && entry.origin.skillActivations !== undefined,
     );
     expect(merged?.content).toEqual([
@@ -864,7 +863,7 @@ describe('prompt queue', () => {
     hold.release();
     await loop.settled();
 
-    const merged = ctx.context.get().find(
+    const merged = ctx.context.history().find(
       (entry) => entry.origin?.kind === 'user' && entry.origin.attachments !== undefined,
     );
     expect(merged?.origin?.kind === 'user' && merged.origin.attachments).toEqual([

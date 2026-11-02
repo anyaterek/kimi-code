@@ -119,6 +119,10 @@ export function restorableChain(
   const reIncluded: WireLine[] = [];
   for (const entry of entries) {
     if (chainLines.has(entry.line)) continue;
+    if (entry.record.type === 'turn.prompt') {
+      reIncluded.push(entry);
+      continue;
+    }
     if (entry.record.type !== 'context.append_message') continue;
     const message = entry.record['message'];
     if (!isContextMessage(message)) continue;

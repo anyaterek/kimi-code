@@ -1,7 +1,8 @@
 import { toDisposable } from '#/_base/di/lifecycle';
 import { Event } from '#/_base/event';
 import type { IAgentLoopService, LoopErrorHandler, LoopErrorHandlerRegistrationOptions, LoopNotify, LoopNotifyHandle, LoopSubmitOptions, PromptHandle, Turn, TurnResult } from '#/agent/loop/loop';
-import type { UserEntry } from '#human/agent/turn';
+import type { HistoryMessage, UserEntry } from '#human/agent/turn';
+import { contextFromHistoryEntry, historyFromContext } from '#/agent/loop/history';
 
 export function submitPromptTurn(
   loop: IAgentLoopService,
@@ -48,8 +49,6 @@ export function submitPromptTurn(
     },
   };
 }
-import type { MachineEngine, MachineEngineAttachBundle } from '#/agent/loop/machine/engine';
-import type { AgentEventStore } from '#human/agent/slices';
 import type { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
 import type { BeforeToolExecuteEvent, ToolDidExecuteContext, WillExecuteToolEvent } from '#/agent/toolExecutor/toolHooks';
 import { OrderedHookSlot } from '#/hooks';
@@ -66,8 +65,10 @@ export type StubLoop = IAgentLoopService & {
   readonly cancels: readonly { readonly turnId?: number; readonly reason?: unknown }[];
   readonly queue: { hasPendingRequests(): boolean };
   startTurn(): StubTurn;
+  resetLoop(): Promise<void>;
   settleActive(result?: TurnResult): void;
-  drainNextBatch(context: { append(...messages: ContextMessage[]): void }): { readonly driver: { readonly kind: string } } | undefined;
+  drainNextBatch(context?: IAgentLoopService): { readonly driver: { readonly kind: string } } | undefined;
+  flushReminders(): void;
 };
 const turnControllers = new WeakMap<Turn, AbortController>();
 export function makeTurn(id: number): StubTurn {
@@ -87,41 +88,6 @@ function registry(): { handlers: LoopErrorHandler[]; register: IAgentLoopService
   };
   return { handlers, register };
 }
-function stubAttachStore(): AgentEventStore {
-  return {
-    ref: { tree: 'test', branch: 'main' },
-    getState: () => ({ history: [], queue: [], notifications: [], reminders: [], turnIndex: { nextTurnId: 0 } }),
-    subscribe: () => () => {},
-    dispatch: () => Promise.resolve({ kind: 'entry', seq: 0, ts: 0, type: 'noop', payload: null }),
-    registerSlice: () => Promise.resolve(() => {}),
-    reset: () => Promise.resolve(),
-    flush: () => Promise.resolve(),
-    close: () => Promise.resolve(),
-  } as unknown as AgentEventStore;
-}
-function stubAttachBundle(): MachineEngineAttachBundle {
-  return { store: stubAttachStore(), request: { model: { provider: 'test', model: 'test' } } } as unknown as MachineEngineAttachBundle;
-}
-function stubAttachEngine(): MachineEngine {
-  return {
-    submit: () => {},
-    steer: () => {},
-    notify: () => {},
-    remind: () => {},
-    cancelQueueItem: () => {},
-    abort: () => {},
-    pause: () => {},
-    resume: () => {},
-    resetHistory: () => Promise.resolve(),
-    resetJournal: () => Promise.resolve(),
-    stop: () => {},
-    snapshot: () => ({ running: false, aborting: false, waitingForBackground: false, paused: false, queue: [], queueLength: 0, queueIds: [], notificationCount: 0, reminderCount: 0, backgroundCount: 0 }),
-    currentStep: () => 0,
-    lastFinish: () => undefined,
-    toolExtras: new Map(),
-    handleToolProgress: () => {},
-  };
-}
 export function stubLoopWithHooks(options: StubLoopOptions = {}): StubLoop {
   const hooks = createHooks(['onWillBeginStep', 'onDidFinishStep', 'onBeforeSubmitPrompt']) as IAgentLoopService['hooks'];
   const errorHandlers = registry(); const launches: number[] = []; const cancels: { turnId?: number; reason?: unknown }[] = [];
@@ -138,9 +104,17 @@ export function stubLoopWithHooks(options: StubLoopOptions = {}): StubLoop {
     launches.push(configured.id); active = configured; return configured;
   };
   const hasPending = () => pending.length > 0;
+  const messages: ContextMessage[] = [];
   const stub: StubLoop = {
     _serviceBrand: undefined, hooks, launches, cancels, startTurn,
     requester: {} as IAgentLoopService['requester'],
+    history: () => messages,
+    historyRevision: () => 0,
+    replaceHistory(next) {
+      messages.splice(0, messages.length, ...next.map((entry) => contextFromHistoryEntry(entry)));
+      return true;
+    },
+    initializeHistory: async (next) => { stub.replaceHistory(next); },
     queue: { hasPendingRequests: hasPending },
     settleActive(result = { type: 'completed', steps: 0, truncated: false }) { releaseActiveResult?.(result); },
     submit(input: UserEntry, options?: LoopSubmitOptions) {
@@ -163,8 +137,10 @@ export function stubLoopWithHooks(options: StubLoopOptions = {}): StubLoop {
       return { id };
     },
     steer: async () => {},
-    remind(note: LoopNotify = {}): LoopNotifyHandle {
-      return this.notify(note);
+    remind(...entries: readonly HistoryMessage[]): void {
+      for (const entry of entries) {
+        pending.push({ kind: 'message', message: contextFromHistoryEntry(entry) });
+      }
     },
     notify(note: LoopNotify = {}): LoopNotifyHandle {
       const entry: PendingEntry = {
@@ -202,19 +178,23 @@ export function stubLoopWithHooks(options: StubLoopOptions = {}): StubLoop {
     cancel(target, reason) { cancels.push({ turnId: target?.turnId, reason }); if (target?.promptId !== undefined) return true; if (active === undefined || (target?.turnId !== undefined && active.id !== target.turnId)) return false; active.cancel(reason); return true; },
     tryAcquireQuiescence: () => toDisposable(() => {}),
     tryAcquireHistorySnapshot: () => toDisposable(() => {}),
-    buildAttachBundle: () => stubAttachBundle(),
-    attachEngine: () => stubAttachEngine(),
-    resetMachineEngine: () => Promise.resolve(),
+    resetLoop: () => Promise.resolve(),
     registerLoopErrorHandler: errorHandlers.register,
     settled: () => Promise.resolve(),
+    close: () => Promise.resolve(),
     drainNextBatch(context) {
       const batch = pending.splice(0);
       if (batch.length === 0) return undefined;
       for (const entry of batch) {
         entry.onConsume?.();
-        if (entry.message !== undefined && entry.message.content.length > 0) context.append(entry.message);
+        if (context !== undefined && entry.message !== undefined && entry.message.content.length > 0) {
+          context.replaceHistory(historyFromContext([...context.history(), entry.message]), 'test');
+        }
       }
       return { driver: { kind: batch[0]!.kind } };
+    },
+    flushReminders() {
+      stub.drainNextBatch(stub);
     },
   };
   return stub;
@@ -229,6 +209,8 @@ export async function runWillBeginStepHooks(
     firstStepOfTurn,
     signal: new AbortController().signal,
   });
+  if ('flushReminders' in loop && typeof loop.flushReminders === 'function') loop.flushReminders();
+  else if ('drainNextBatch' in loop && typeof loop.drainNextBatch === 'function') loop.drainNextBatch(loop);
 }
 export function stubWire(): IWireService { return stubAgentWire(); }
 export function stubToolExecutor(): IAgentToolExecutorService { return { _serviceBrand: undefined, execute: async function* () {}, onBeforeExecuteTool: Event.None as Event<BeforeToolExecuteEvent>, onWillExecuteTool: Event.None as Event<WillExecuteToolEvent>, hooks: { onDidExecuteTool: new OrderedHookSlot<ToolDidExecuteContext>() }, recordDupType: () => {}, registerToolCallGuard: () => ({ dispose() {} }), registerUnavailableToolDescriber: () => ({ dispose() {} }), registerMissingToolDescriber: () => ({ dispose() {} }) }; }

@@ -143,6 +143,9 @@ import {
   isWorkDirKey,
   workspaceRootKey,
 } from '@moonshot-ai/agent-core-v2/_base/utils/workdir-slug';
+import { ContextClear } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextEvents';
+import { IEventDispatcher } from '@moonshot-ai/agent-core-v2/state/eventDispatcher';
+import { historyEntryFromContext } from '@moonshot-ai/agent-core-v2/agent/loop/history';
 import { McpConnectionManager } from '@moonshot-ai/agent-core-v2/mcpCore/connection-manager';
 import { ITowerRateLimitService } from '@moonshot-ai/agent-core-v2/features/tower/towerRateLimit';
 import { readTowerStatusSummary } from '@moonshot-ai/agent-core-v2/features/tower/tools/status/statusReader';
@@ -163,7 +166,6 @@ import {
   reloadOnStale,
   agentContextOf,
   IAgentChangeNotifierService,
-  IAgentContextMemoryService,
   IAgentConversationUndoService,
   IAgentCronService,
   IAgentFullCompactionService,
@@ -2299,21 +2301,20 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
   }
 
   /**
-   * Through the agent scope (`IAgentContextMemoryService.clear`) — no klient
+   * Through the agent scope (`IAgentLoopService.replaceHistory`) — no klient
    * facade exists. v1's `context.clear` has no busy check and does not touch
-   * queued or running prompts; the memory-service clear matches that exactly
+   * queued or running prompts; the Loop clear matches that exactly
    * (the prompt service's own `clear` would additionally abort prompts).
    */
   override async clearContext(input: SessionIdRpcInput): Promise<void> {
     const agent = await this.agentScope(input.sessionId);
-    agent.accessor.get(IAgentContextMemoryService).clear();
+    await agent.accessor.get(IEventDispatcher).dispatch(new ContextClear({ agentId: agentContextOf(agent).agentId }));
+    agent.accessor.get(IAgentLoopService).replaceHistory([], 'clear');
   }
 
   /**
-   * No v2 engine capability exists for import-context (nothing under
-   * agent-core-v2 builds this message), so the SDK composes v1's exact
-   * behavior over v2 primitives: the same busy rejection
-   * (`turn.agent_busy`), the byte-identical import message and validations
+   * The SDK composes v1's exact behavior over Loop primitives: the same busy
+   * rejection (`turn.agent_busy`), the byte-identical import message and validations
    * (`src/v2/import-context.ts`), the same overflow gate, then the same wire
    * `context.append_message` Op v1 persists. Known gap: v1 also adopts the
    * post-import estimate as its reported token count, while v2's reported
@@ -2341,7 +2342,9 @@ export class SDKRpcClientV2 extends SDKRpcClientBase {
       currentTokenCount,
       capability.max_input_tokens ?? capability.max_context_tokens,
     );
-    agent.accessor.get(IAgentContextMemoryService).append(message);
+    const loop = agent.accessor.get(IAgentLoopService);
+    loop.remind(historyEntryFromContext(message));
+    loop.flushReminders();
   }
 
   /**

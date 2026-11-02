@@ -24,7 +24,6 @@ import { ProcessTask } from '#/agent/tools/os/bash/process-task';
 import type { IHostProcess } from '#/os/interface/hostProcess';
 import { IConfigRegistry, IConfigService } from '#/app/config/config';
 import { IFlagService } from '#/app/flag/flag';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage, TaskOrigin } from '#/agent/contextMemory/types';
 import { IAgentLoopService } from '#/agent/loop/loop';
 import { IAgentScopeContext, makeAgentScopeContext } from '#/agent/scopeContext/scopeContext';
@@ -133,7 +132,7 @@ describe('AgentTaskService', () => {
         throw new Error('ITaskService.defer is not used by this test');
       },
     });
-    ix.stub(IAgentContextMemoryService, stubContextMemory());
+    ix.stub(IAgentLoopService, stubContextMemory());
     ix.stub(ITelemetryService, { track2: () => {} });
     ix.stub(IAgentToolRegistryService, {
       register: () => toDisposable(() => {}),
@@ -270,7 +269,7 @@ describe('AgentTaskService', () => {
     await waitForCondition(() => loop.snapshot().hasPendingRequests);
     expect(loop.snapshot().hasPendingRequests).toBe(true);
 
-    loop.drainNextBatch({ append: () => {} });
+    loop.drainNextBatch();
     armOnRead = true;
     const second = svc.registerTask(outputtingTask('done\n'));
     await svc.wait(second, 1000);
@@ -344,7 +343,7 @@ describe('AgentTaskService', () => {
     const loop = stubLoop();
     await waitForCondition(() => loop.snapshot().hasPendingRequests);
 
-    const context = ix.get(IAgentContextMemoryService) as StubContextMemory;
+    const context = ix.get(IAgentLoopService) as StubContextMemory;
     loop.drainNextBatch(context);
 
     const delivered = context.messages.filter((message) => message.origin?.kind === 'task');
@@ -743,7 +742,7 @@ describe('AgentTaskService', () => {
         throw new Error('ITaskService.defer is not used by this test');
       },
     });
-    ix.stub(IAgentContextMemoryService, stubContextMemory());
+    ix.stub(IAgentLoopService, stubContextMemory());
     ix.stub(ITelemetryService, { track2: () => {} });
     ix.stub(IAgentLoopService, stubLoopWithHooks());
     ix.stub(IConfigService, {
@@ -800,7 +799,7 @@ describe('AgentTaskService', () => {
         throw new Error('ITaskService.defer is not used by this test');
       },
     });
-    ix.stub(IAgentContextMemoryService, context);
+    ix.stub(IAgentLoopService, context);
     ix.stub(ITelemetryService, { track2: () => {} });
     ix.stub(IAgentLoopService, stubLoopWithHooks());
     ix.stub(IConfigService, {

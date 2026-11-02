@@ -1,4 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendContext } from '../contextMemory/stubs';
 import { tmpdir } from 'node:os';
 import { join } from 'pathe';
 
@@ -294,11 +295,11 @@ describe('FullCompaction', () => {
       },
       { role: 'user', text: buildCompactionContinuationText() },
     ]);
-    expect(ctx.context.get().at(-2)?.content[0]).toMatchObject({
+    expect(ctx.context.history().at(-2)?.content[0]).toMatchObject({
       type: 'text',
       text: expect.stringContaining('The conversation so far has been compacted'),
     });
-    expect(ctx.context.get().at(-1)).toMatchObject({
+    expect(ctx.context.history().at(-1)).toMatchObject({
       role: 'user',
       origin: { kind: 'injection', variant: 'compaction_continuation' },
     });
@@ -1035,7 +1036,7 @@ describe('FullCompaction', () => {
       modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
     });
     ctx.appendExchange(1, 'small user one', 'small assistant one', 20);
-    ctx.context.append({
+    appendContext(ctx.context,{
       role: 'user',
       content: [{ type: 'text', text: 'X'.repeat(400_000) }],
     });
@@ -1045,7 +1046,7 @@ describe('FullCompaction', () => {
     await failed;
 
     expect(calls).toBe(1);
-    expect(ctx.context.get()).toHaveLength(3);
+    expect(ctx.context.history()).toHaveLength(3);
   });
 
   it('waits before retrying compaction generation after a retryable failure', async () => {
@@ -1626,7 +1627,7 @@ describe('FullCompaction', () => {
         tool[call_open_two]: text "Tool result is not available in the current context. Do not assume the tool completed successfully."
         user: text <compaction-instruction>
     `);
-    expect(ctx.context.get().map((message) => message.role)).toEqual([
+    expect(ctx.context.history().map((message) => message.role)).toEqual([
       'user',
       'user',
       'user',
@@ -1641,7 +1642,7 @@ describe('FullCompaction', () => {
         result: { output: 'two result' },
       },
     });
-    expect(ctx.context.get().map((message) => message.role)).toEqual([
+    expect(ctx.context.history().map((message) => message.role)).toEqual([
       'user',
       'user',
       'user',
@@ -1786,7 +1787,7 @@ describe('FullCompaction', () => {
         i * 1_850,
       );
     }
-    const initialTokens = estimateTokensForMessages(ctx.context.get());
+    const initialTokens = estimateTokensForMessages(ctx.context.history());
     const completed = ctx.once('compaction.completed');
     ctx.mockNextResponse({ type: 'text', text: 'Auto summary.' });
 
@@ -1923,8 +1924,11 @@ describe('FullCompaction', () => {
     expect(eventIndex(events, 'compaction.blocked')).toBeLessThan(
       eventIndex(events, 'full_compaction.complete'),
     );
+    expect(eventIndex(events, 'turn.step.started')).toBeLessThan(
+      eventIndex(events, 'full_compaction.begin'),
+    );
     expect(eventIndex(events, 'full_compaction.complete')).toBeLessThan(
-      eventIndex(events, 'turn.step.started'),
+      eventIndex(events, 'turn.ended'),
     );
     expect(ctx.llmInputs()).toMatchInlineSnapshot(`
       call 1:
@@ -2028,7 +2032,7 @@ describe('FullCompaction', () => {
       variant: 'host',
     });
 
-    expect(ctx.context.get().map((m) => m.role)).toEqual([
+    expect(ctx.context.history().map((m) => m.role)).toEqual([
       'user',
       'assistant',
       'user',
@@ -2050,14 +2054,14 @@ describe('FullCompaction', () => {
     await ctx.rpc.beginCompaction({});
     await compacted;
 
-    expect(ctx.context.get().map((m) => m.role)).toEqual([
+    expect(ctx.context.history().map((m) => m.role)).toEqual([
       'user',
       'user',
       'user',
       'user',
     ]);
-    expect(ctx.context.get().at(-2)?.origin).toEqual({ kind: 'compaction_summary' });
-    expect(ctx.context.get().at(-1)?.origin).toEqual({ kind: 'injection', variant: 'compaction_continuation' });
+    expect(ctx.context.history().at(-2)?.origin).toEqual({ kind: 'compaction_summary' });
+    expect(ctx.context.history().at(-1)?.origin).toEqual({ kind: 'injection', variant: 'compaction_continuation' });
 
     await ctx.dispatch({
       type: 'context.append_loop_event',
@@ -2077,7 +2081,7 @@ describe('FullCompaction', () => {
         result: { output: 'two result' },
       },
     });
-    expect(ctx.context.get().map((m) => m.role)).toEqual([
+    expect(ctx.context.history().map((m) => m.role)).toEqual([
       'user',
       'user',
       'user',
@@ -2098,7 +2102,7 @@ describe('FullCompaction', () => {
       variant: 'host',
     });
 
-    expect(ctx.context.get().map((m) => m.role)).toEqual([
+    expect(ctx.context.history().map((m) => m.role)).toEqual([
       'user',
       'assistant',
       'user',
@@ -2121,14 +2125,14 @@ describe('FullCompaction', () => {
     await ctx.rpc.beginCompaction({});
     await compacted;
 
-    expect(ctx.context.get().map((m) => m.role)).toEqual([
+    expect(ctx.context.history().map((m) => m.role)).toEqual([
       'user',
       'user',
       'user',
       'user',
     ]);
-    expect(ctx.context.get().at(-2)?.origin).toEqual({ kind: 'compaction_summary' });
-    expect(ctx.context.get().at(-1)?.origin).toEqual({ kind: 'injection', variant: 'compaction_continuation' });
+    expect(ctx.context.history().at(-2)?.origin).toEqual({ kind: 'compaction_summary' });
+    expect(ctx.context.history().at(-1)?.origin).toEqual({ kind: 'injection', variant: 'compaction_continuation' });
 
     await ctx.dispatch({
       type: 'context.append_loop_event',
@@ -2139,7 +2143,7 @@ describe('FullCompaction', () => {
         result: { output: 'two result' },
       },
     });
-    expect(ctx.context.get().map((m) => m.role)).toEqual([
+    expect(ctx.context.history().map((m) => m.role)).toEqual([
       'user',
       'user',
       'user',
@@ -2284,7 +2288,7 @@ describe('FullCompaction', () => {
       .get(IAgentToolRegistryService)
       .register(mcpTool(LARGE_MCP_TOOL, parameters), { source: 'mcp', disclosure: 'deferred' });
     try {
-      ctx.context.append({
+      appendContext(ctx.context,{
         role: 'system',
         content: [],
         tools: [
@@ -2458,7 +2462,7 @@ describe('FullCompaction', () => {
         args: expect.objectContaining({
           result: expect.objectContaining({
             summary: 'Overflow compacted summary.',
-            compactedCount: 4,
+            compactedCount: 3,
           }),
         }),
       }),
@@ -2680,8 +2684,8 @@ describe('FullCompaction', () => {
     const events = await ctx.untilTurnEnd();
 
     expect(callCount).toBe(5);
-    expect(eventIndex(events, 'compaction.started')).toBeLessThan(
-      eventIndex(events, 'turn.step.started'),
+    expect(eventIndex(events, 'turn.step.started')).toBeLessThan(
+      eventIndex(events, 'compaction.started'),
     );
     expect(events).toContainEqual(
       expect.objectContaining({
@@ -2696,7 +2700,7 @@ describe('FullCompaction', () => {
     expect(events).toContainEqual(
       expect.objectContaining({
         event: 'turn.ended',
-        args: expect.objectContaining({ turnId: 2, reason: 'completed' }),
+        args: expect.objectContaining({ turnId: 1, reason: 'completed' }),
       }),
     );
     await ctx.expectResumeMatches();
@@ -2786,8 +2790,8 @@ describe('FullCompaction', () => {
     const events = await ctx.untilTurnEnd();
 
     expect(callCount).toBe(5);
-    expect(eventIndex(events, 'compaction.started')).toBeLessThan(
-      eventIndex(events, 'turn.step.started'),
+    expect(eventIndex(events, 'turn.step.started')).toBeLessThan(
+      eventIndex(events, 'compaction.started'),
     );
   });
 
@@ -3029,7 +3033,7 @@ describe('FullCompaction', () => {
         args: expect.objectContaining({
           result: expect.objectContaining({
             summary: 'Unknown window compacted summary.',
-            compactedCount: 4,
+            compactedCount: 3,
           }),
         }),
       }),
@@ -3483,11 +3487,11 @@ describe('FullCompaction', () => {
       role: 'user',
       text: buildCompactionContinuationText(),
     });
-    expect(ctx.context.get().at(-2)?.content[0]).toMatchObject({
+    expect(ctx.context.history().at(-2)?.content[0]).toMatchObject({
       type: 'text',
       text: expect.stringContaining('The conversation so far has been compacted'),
     });
-    expect(ctx.context.get().at(-1)).toMatchObject({
+    expect(ctx.context.history().at(-1)).toMatchObject({
       role: 'user',
       origin: { kind: 'injection', variant: 'compaction_continuation' },
     });
@@ -3539,7 +3543,7 @@ describe('FullCompaction context recovery pointer', () => {
   }
 
   function noteText(ctx: TestAgentContext): string {
-    const part = ctx.context.get().at(-2)?.content[0];
+    const part = ctx.context.history().at(-2)?.content[0];
     return part?.type === 'text' ? part.text : '';
   }
 
@@ -3632,7 +3636,7 @@ describe('FullCompaction context recovery pointer', () => {
   it('starts the window after the latest context.clear record', async () => {
     const ctx = recoveryAgent(appService(IFileSystemStorageService, locatedStorage(JOURNAL_HOME)));
     ctx.appendExchange(1, 'discarded user one', 'discarded assistant one', 20);
-    ctx.context.clear();
+    ctx.clearContext();
     ctx.appendExchange(2, 'post-clear user two', 'post-clear assistant two', 40);
 
     await compactOnce(ctx, 'Post-clear summary.');
@@ -4102,7 +4106,7 @@ describe('goal reminder re-injection after full compaction', () => {
     await completed;
 
     const reminderMessages = ctx.context
-      .get()
+      .history()
       .filter(
         (message) => message.origin?.kind === 'injection' && message.origin.variant === 'goal',
       );
@@ -4557,7 +4561,7 @@ describe('FullCompaction pre-shrink', () => {
         step === 4 ? 200_000 : 0,
       );
     }
-    const previousHistory = ctx.context.get().map(messageText);
+    const previousHistory = ctx.context.history().map(messageText);
 
     ctx.mockNextResponse({ type: 'text', text: 'Full-history summary.' });
     ctx.mockNextResponse({ type: 'text', text: 'Answer after compaction.' });
@@ -4612,7 +4616,7 @@ describe('FullCompaction pre-shrink', () => {
         step === 4 ? 200_000 : 0,
       );
     }
-    const previousHistory = ctx.context.get().map(messageText);
+    const previousHistory = ctx.context.history().map(messageText);
 
     await ctx.rpc.prompt({ input: [{ type: 'text', text: `large prompt ${' zz'.repeat(12_000)}` }] });
     await ctx.untilTurnEnd();

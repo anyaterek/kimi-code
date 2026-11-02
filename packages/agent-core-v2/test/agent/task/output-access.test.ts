@@ -97,7 +97,7 @@ async function waitForTaskNotifications(
     expect(loop.snapshot().hasPendingRequests).toBe(false);
   });
 
-  const origins = ctx.context.get().map((message) => message.origin);
+  const origins = ctx.context.history().map((message) => message.origin);
   for (const task of tasks) {
     expect(origins).toContainEqual({
       kind: 'task',

@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { afterEach } from 'vitest';
 
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
+import { IAgentLoopService } from '#/agent/loop/loop';
 import type {
   AgentLLMRequestOverrides,
   AgentLLMRequestPartHandler,
@@ -55,7 +55,7 @@ export function promptCacheComparisons(): number {
 export class PromptCacheGuardedLoopRequester implements LoopRequester {
   constructor(
     private readonly inner: LoopRequester,
-    private readonly context: IAgentContextMemoryService,
+    private readonly context: IAgentLoopService,
   ) {}
 
   prepareTurnConfig(turnId: number): PreparedTurnRequestConfig | undefined {
@@ -83,7 +83,7 @@ export class PromptCacheGuardedLoopRequester implements LoopRequester {
     onPart?: AgentLLMRequestPartHandler,
     signal?: AbortSignal,
   ): AgentLLMRequestTask {
-    const contextRevision = this.context.prefixRevision();
+    const contextRevision = this.context.historyRevision();
     const scope: RequestScope = {
       agent: this,
       source: overrides?.source,

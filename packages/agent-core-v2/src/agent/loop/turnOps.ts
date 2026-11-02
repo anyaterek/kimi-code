@@ -37,7 +37,7 @@ const turnPromptSchema = z.object({
 
 export class TurnPrompt extends AgentEvent2<z.infer<typeof turnPromptSchema>> {
   static override readonly type = 'turn.prompt';
-  static override readonly durable = true;
+  static override readonly durable = false;
   static override readonly observable = true;
   static override readonly schema = turnPromptSchema;
 }
@@ -60,7 +60,7 @@ const turnSteerSchema = z.object({
 
 export class TurnSteer extends AgentEvent2<z.infer<typeof turnSteerSchema>> {
   static override readonly type = 'turn.steer';
-  static override readonly durable = true;
+  static override readonly durable = false;
   static override readonly observable = true;
   static override readonly schema = turnSteerSchema;
 }
@@ -115,7 +115,7 @@ export interface TurnEndedPayload {
 
 export class TurnEnded extends AgentEvent2<TurnEndedPayload> {
   static override readonly type = 'turn.ended';
-  static override readonly durable = true;
+  static override readonly durable = false;
   static override readonly observable = true;
   static override readonly schema = turnEndedSchema;
 

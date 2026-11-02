@@ -86,10 +86,11 @@ export function foldWireRecords(
   decodePersistent?: (record: WireRecord) => WireRecord,
   matchingRecords?: readonly WireRecord[],
 ): WireReplayFold {
+  const matching = matchingRecords ?? records;
   const turnIdByAppend = new Map<WireRecord, number>();
-  for (const match of matchWireTurnInputRecords(matchingRecords ?? records, true)) {
+  for (const match of matchWireTurnInputRecords(matching, true)) {
     if (match.turnId !== undefined) {
-      turnIdByAppend.set((matchingRecords ?? records)[match.appendIndex]!, match.turnId);
+      turnIdByAppend.set(matching[match.appendIndex]!, match.turnId);
     }
   }
   const fold = new WireReplayFoldState();

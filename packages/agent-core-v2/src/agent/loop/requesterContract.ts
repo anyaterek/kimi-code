@@ -11,6 +11,8 @@ import type { TokenUsage } from '#human/llm-requester/usage';
 import type { LLMRequestTrace } from '#/llm-adapter/contract/request-trace';
 import type { ModelRequestTiming } from '#/llm-adapter/model/generate';
 import type { LogContext } from '#/_base/log/log';
+import type { LlmOutcome } from '#human/llm/response';
+import type { LlmDimension, LlmRequester } from '#human/llm/requester';
 
 export type AgentLLMRequestLogFields = Readonly<LogContext>;
 
@@ -60,6 +62,14 @@ export interface AgentLLMRequestTask {
 export interface PreparedTurnRequestConfig {
   readonly thinkingEffort: ThinkingEffort;
 }
+
+export interface CoreLoopRequesterOptions {
+  readonly source: () => Extract<AgentLLMRequestSource, { type: 'turn' }>;
+  readonly onTrace?: (trace: LLMRequestTrace) => void;
+  readonly onOutcome?: (outcome: Extract<LlmOutcome, { type: 'done' }>) => void;
+}
+
+export type CoreLoopRequester = LlmRequester<LlmDimension>;
 
 export interface LoopRequester {
   prepareTurnConfig(turnId: number): PreparedTurnRequestConfig | undefined;

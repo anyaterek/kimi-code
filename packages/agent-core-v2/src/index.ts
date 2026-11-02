@@ -635,8 +635,6 @@ export * from '#/app/web/providers/moonshot-fetch-url';
 
 export * from '#/agent/blob/agentBlobService';
 export * from '#/agent/blob/agentBlobServiceImpl';
-export * from '#/agent/contextMemory/contextMemory';
-export * from '#/agent/contextMemory/contextMemoryService';
 export * from '#/agent/contextMemory/contextOps';
 export * from '#/agent/contextMemory/compactionHandoff';
 export * from '#/agent/contextMemory/conversationUndoParticipants';

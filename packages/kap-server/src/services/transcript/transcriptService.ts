@@ -5,7 +5,6 @@ import { readFile } from 'node:fs/promises';
 
 import {
   IAgentLifecycleService,
-  IAgentContextMemoryService,
   IFlagService,
   IWireService,
   IBlobStore,
@@ -470,7 +469,7 @@ export class TranscriptService {
         ?.accessor.get(IAgentLifecycleService).handleOf(agentId);
       if (agent !== undefined) {
         const current = entry.store.ensureAgent(agentId).snapshot();
-        const retained = groupMessagesIntoSnapshot(agent.accessor.get(IAgentContextMemoryService).get());
+        const retained = groupMessagesIntoSnapshot(agent.accessor.get(IAgentLoopService).history());
         snapshot = { ...current, items: retained.items, attachments: retained.attachments, prompts: [] };
       }
     }

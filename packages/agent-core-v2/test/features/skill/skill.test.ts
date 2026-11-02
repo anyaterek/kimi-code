@@ -53,7 +53,7 @@ describe('AgentSkillService', () => {
     expect(launched.turn_id).toBe(0);
     await ctx.untilTurnEnd();
 
-    const activation = ctx.context.get().find((m) => m.origin?.kind === 'skill_activation');
+    const activation = ctx.context.history().find((m) => m.origin?.kind === 'skill_activation');
     expect(activation?.role).toBe('user');
     expect(activation?.origin).toMatchObject({
       kind: 'skill_activation',
@@ -104,7 +104,7 @@ describe('AgentSkillService', () => {
 
     expect(finished).toBe(true);
     await ctx.untilTurnEnd();
-    expect(ctx.context.get().some((m) => m.origin?.kind === 'skill_activation')).toBe(true);
+    expect(ctx.context.history().some((m) => m.origin?.kind === 'skill_activation')).toBe(true);
   });
 });
 
@@ -203,7 +203,7 @@ describe('SkillTool', () => {
       output: 'Skill "commit" loaded inline. Follow its instructions.',
     });
     expect(result.output).not.toContain('# Commit');
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
     expect(result.delivery?.kind).toBe('steer');
     expect(result.delivery?.message.origin).toMatchObject({
       kind: 'skill_activation',
@@ -232,7 +232,7 @@ describe('SkillTool', () => {
       toolContext({ skill: 'commit' }),
     );
 
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
     expect(nested.delivery?.message.origin).toMatchObject({
       kind: 'skill_activation',
       trigger: 'nested-skill',
@@ -250,7 +250,7 @@ describe('SkillTool', () => {
         toolContext({ skill: 'commit' }),
       ),
     ).rejects.toBeInstanceOf(NestedSkillTooDeepError);
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
   });
 });
 

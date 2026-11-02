@@ -1321,7 +1321,7 @@ describe('WaitForTool (harness)', () => {
       await steered;
       await waitForTerminal(tasks, taskId);
       await vi.waitFor(() => {
-        const deliveries = ctx.context.get().filter((message) =>
+        const deliveries = ctx.context.history().filter((message) =>
           (message.origin?.kind === 'task' && message.origin.taskId === taskId) ||
           (message.role === 'tool' && message.toolCallId === 'racing-wait' && message.content.some((part) =>
             part.type === 'text' && part.text.includes('wait_status: completed'),
@@ -1331,7 +1331,7 @@ describe('WaitForTool (harness)', () => {
       });
       await ctx.get(IAgentLoopService).settled();
 
-      const history = ctx.context.get();
+      const history = ctx.context.history();
       expect(await tasks.readOutput(taskId)).toBe('BACKGROUND-RESULT');
       expect(history.filter((message) => message.content.some((part) =>
         part.type === 'text' && part.text === 'Handle the new request too.',
@@ -1399,7 +1399,7 @@ describe('WaitForTool (harness)', () => {
 
       expect(loop.snapshot().hasPendingRequests).toBe(false);
       loop.drainNextBatch(ctx.context);
-      expect(ctx.context.get().some((message) => message.origin?.kind === 'task')).toBe(false);
+      expect(ctx.context.history().some((message) => message.origin?.kind === 'task')).toBe(false);
       expect(ctx.allEvents.some((event) => event.event === 'task.notified')).toBe(false);
       expect(ctx.llmCalls).toHaveLength(0);
       expect(

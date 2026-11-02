@@ -1,133 +1,14 @@
-import { isDraft, original } from 'immer';
-import { z } from 'zod';
-
 import { ErrorCodes, Error2 } from '#/errors';
-import type { ContentPart } from '#human/llm/message';
-import { defineState } from '#/state/state';
-import type { PartsTransformer } from '#/wire/record';
-import type { WireRecord } from '#/wire/record';
 
 import {
   buildContextCompactionShape,
   createCompactionSummaryMessage,
   type ContextCompactionShapeInput,
 } from './compactionHandoff';
-import {
-  ContextAppendLoopEvent,
-  ContextAppendMessage,
-  ContextApplyCompaction,
-  ContextClear,
-  type ContextApplyCompactionPayload,
-} from './contextEvents';
+import type { ContextApplyCompactionPayload } from './contextEvents';
 import { isPromptOwnedInjection, isUndoAnchor } from './conversationTime';
-import {
-  foldAppendMessage,
-  foldLoopEvent,
-  resetFold,
-  type LoopRecordedEvent,
-} from './loopEventFold';
+import { resetFold } from './loopEventFold';
 import type { ContextMessage } from './types';
-
-async function dehydrateMessages(
-  messages: readonly ContextMessage[],
-  transform: PartsTransformer,
-): Promise<{ changed: boolean; result: ContextMessage[] }> {
-  let changed = false;
-  const result: ContextMessage[] = [];
-  for (const msg of messages) {
-    const parts = await transform(msg.content);
-    if (parts !== msg.content) {
-      changed = true;
-      result.push({ ...msg, content: [...parts] as ContentPart[] });
-    } else {
-      result.push(msg);
-    }
-  }
-  return { changed, result };
-}
-
-async function dehydrateRecord(
-  record: WireRecord,
-  transform: PartsTransformer,
-): Promise<WireRecord> {
-  if (record.type === 'context.append_message') {
-    const message = record['message'] as ContextMessage | undefined;
-    if (message === undefined) return record;
-    const parts = await transform(message.content);
-    if (parts === message.content) return record;
-    return { ...record, message: { ...message, content: [...parts] } };
-  }
-  if (record.type === 'context.append_loop_event') {
-    const event = record['event'] as LoopRecordedEvent | undefined;
-    if (event === undefined) return record;
-    if (event.type === 'content.part') {
-      const parts = await transform([event.part]);
-      if (parts[0] === event.part) return record;
-      return { ...record, event: { ...event, part: parts[0] } };
-    }
-    if (event.type === 'tool.result') {
-      const output = event.result.output;
-      if (!Array.isArray(output)) return record;
-      const parts = await transform(output);
-      if (parts === output) return record;
-      return { ...record, event: { ...event, result: { ...event.result, output: [...parts] } } };
-    }
-    return record;
-  }
-  return record;
-}
-
-export const contextMemoryKey = defineState('contextMemory', (): ContextMessage[] => [])
-  .replayable({
-    schema: z.custom<ContextMessage[]>(),
-    blobs: {
-      dehydrate: dehydrateRecord,
-      rehydrate: async (state, transform) => {
-        const { changed, result } = await dehydrateMessages(state, transform);
-        return changed ? result : state;
-      },
-    },
-    mutableReplay: true,
-  })
-  .undoable({
-    onUndo: (s, count) => {
-      if (s.length === 0) return;
-      const cut = computeUndoCut(s, count);
-      if (!isFullyUndoable(cut, count)) return;
-      return resetFold(s.slice(0, cut.cutIndex)) as ContextMessage[];
-    },
-  })
-  .on(ContextAppendMessage, (s, e, ctx) => foldAppendMessage(dropSupersededReminders(s, e.message), e.message, ctx.silent) as ContextMessage[])
-  .on(ContextAppendLoopEvent, (s, e, ctx) => foldLoopEvent(s, e.event, ctx.silent) as ContextMessage[])
-  .on(ContextClear, (s) => (s.length === 0 ? undefined : (resetFold([]) as ContextMessage[])))
-  .on(ContextApplyCompaction, (s, e) => {
-    const result = buildContextCompactionShape(
-      s,
-      readContextCompactionShapeInput(e as unknown as ContextApplyCompactionPayload),
-    );
-    return resetFold([...result.messages]) as ContextMessage[];
-  });
-
-const STATE_DERIVED_REMINDER_VARIANTS: ReadonlySet<string> = new Set([
-  'environment_binding',
-  'project_context',
-]);
-
-function dropSupersededReminders(
-  state: readonly ContextMessage[],
-  message: ContextMessage,
-): readonly ContextMessage[] {
-  const origin = message.origin;
-  if (origin?.kind !== 'injection' || !STATE_DERIVED_REMINDER_VARIANTS.has(origin.variant)) {
-    return state;
-  }
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const source = (isDraft(state) ? original(state as any) : state) as readonly ContextMessage[];
-  return source.filter(
-    (existing) =>
-      existing.origin?.kind !== 'injection' || existing.origin.variant !== origin.variant,
-  );
-}
 
 export function popSwarmModeReminder(state: ContextMessage[]): ContextMessage[] {
   const last = state.at(-1);

@@ -46,7 +46,7 @@ import {
 import { renderNotificationXml } from './notificationXml';
 import { formatTaskWallTime } from './wallTime';
 
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
+import { historyEntryFromContext } from '#/agent/loop/history';
 import { IConfigService } from '#/app/config/config';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
@@ -230,7 +230,6 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
 
   constructor(
     @ITelemetryService private readonly telemetry: ITelemetryService,
-    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
     @IConfigService private readonly config: IConfigService,
     @IAtomicDocumentStore atomicDocs: IAtomicDocumentStore,
     @IFileSystemStorageService byteStore: IFileSystemStorageService,
@@ -293,6 +292,10 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
         for (const message of e.messages) {
           if (isTaskOrigin(message.origin)) {
             this.markDeliveredNotification(message.origin);
+            void this.dispatcher.dispatch(new TaskWaitDelivered({
+              agentId: this.scopeContext.agentId,
+              keys: [notificationKey(message.origin)],
+            }));
           }
         }
       }),
@@ -1254,7 +1257,7 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
 
   private hasPreviousSessionReminder(taskId: string): boolean {
     const taskLinePrefix = `- ${taskId} "`;
-    return this.context.get().some((message) => {
+    return this.loop.history().some((message) => {
       if (
         message.origin?.kind !== 'injection' ||
         message.origin.variant !== TASK_RESUME_TERMINATION_VARIANT
@@ -1313,11 +1316,11 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
   private async restoreAgentTaskNotification(info: AgentTaskInfo): Promise<void> {
     const context = await this.buildAgentTaskNotificationContext(info);
     if (context === undefined) return;
-    this.context.append({
+    this.loop.remind(historyEntryFromContext({
       role: 'user',
       content: [...context.content],
       origin: context.origin,
-    });
+    }));
     this.fireNotificationHook(context.notification);
   }
 
@@ -1424,7 +1427,7 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
   }
 
   private hasDeliveredNotification(key: string): boolean {
-    return this.context.get().some((message) => {
+    return this.loop.history().some((message) => {
       return isTaskOrigin(message.origin) && notificationKey(message.origin) === key;
     });
   }

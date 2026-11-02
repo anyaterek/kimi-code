@@ -4,8 +4,9 @@ import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { defineState } from '#/state/state';
 import { estimateTokensForMessage } from "#/llm-adapter/contract/tokens";
-import { buildCompactionSummaryText, isRealUserInput } from '#/agent/contextMemory/compactionHandoff';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
+import { buildCompactionSummaryText, buildContextCompactionShape, isRealUserInput } from '#/agent/contextMemory/compactionHandoff';
+import { ContextApplyCompaction } from '#/agent/contextMemory/contextEvents';
+import { historyFromContext } from '#/agent/loop/history';
 import type { ContextMessage } from '#/agent/contextMemory/types';
 import { ISessionTokenCountingService } from '#/session/tokenCounting/sessionTokenCounting';
 import type { AgentLLMRequestFinish } from '#/agent/loop/requesterContract';
@@ -138,7 +139,6 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
   private _compacting: ActiveCompaction | null = null;
 
   constructor(
-    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
     @ISessionTokenCountingService private readonly tokenCounting: ISessionTokenCountingService,
     @IAgentProfileService private readonly profile: IAgentProfileService,
     @IAgentToolSelectService private readonly toolSelect: IAgentToolSelectService,
@@ -275,7 +275,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
   }
 
   private currentRequestTokens(): number {
-    return this.requestTokens(this.context.get());
+    return this.requestTokens(this.loopService.history());
   }
 
   private requestTokens(messages: readonly Message[]): number {
@@ -368,7 +368,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
   }
 
   private validateCompactionStart(source: CompactionBeginData['source']): number {
-    const history = this.context.get();
+    const history = this.loopService.history();
     if (history.length === 0) {
       throw new Error2(ErrorCodes.COMPACTION_UNABLE, 'No messages to compact in current history.');
     }
@@ -504,7 +504,8 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
     ) {
       return false;
     }
-    if (!this.strategy.shouldCompact(this.tokenCountWithPending())) return false;
+    const shouldCompact = this.strategy.shouldCompact(this.tokenCountWithPending());
+    if (!shouldCompact) return false;
     return this.beginAutoCompaction(throwOnLimit);
   }
 
@@ -606,7 +607,8 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
     data: Readonly<CompactionBeginData>,
   ): Promise<CompactionResult> {
     const startedAt = Date.now();
-    const originalHistory = [...this.context.get()];
+    this.loopService.flushReminders();
+    const originalHistory = [...this.loopService.history()];
     const tokensBefore = this.requestTokens(originalHistory);
     let retryCount = 0;
     let thinkingEffort = this.profile.data().thinkingLevel;
@@ -742,7 +744,7 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
         );
       }
 
-      if (!historySafeToCompact(this.context.get(), originalHistory)) {
+      if (!historySafeToCompact(this.loopService.history(), originalHistory)) {
         const active = this._compacting;
         if (active !== null) {
           this.cancelActive(active);
@@ -755,21 +757,55 @@ export class AgentFullCompactionService extends Service implements IAgentFullCom
       signal.throwIfAborted();
       const recoveryFooter = this.renderRecoveryFooter(wireLines);
       const summaryText = buildCompactionSummaryText(summary);
-      const result = this.context.applyCompaction({
+      const contextSummary = recoveryFooter === undefined ? summaryText : `${summaryText}\n\n${recoveryFooter}`;
+      const summaryOutputTokens = attempt.usage === null
+        ? undefined
+        : attempt.usage.output +
+          (recoveryFooter === undefined ? 0 : this.tokenCounting.estimateText(recoveryFooter));
+      const dropped = droppedCount === 0 ? undefined : droppedCount;
+      this.loopService.flushReminders();
+      const currentHistory = [...this.loopService.history()];
+      if (!historySafeToCompact(currentHistory, originalHistory)) {
+        const active = this._compacting;
+        if (active !== null) this.cancelActive(active);
+        throw compactionCancelledReason(active);
+      }
+      const compacted = buildContextCompactionShape(currentHistory, {
         summary,
-        contextSummary:
-          recoveryFooter === undefined ? summaryText : `${summaryText}\n\n${recoveryFooter}`,
+        contextSummary,
         compactedCount: originalHistory.length,
         tokensBefore,
-        summaryOutputTokens:
-          attempt.usage === null
-            ? undefined
-            : attempt.usage.output +
-              (recoveryFooter === undefined ? 0 : this.tokenCounting.estimateText(recoveryFooter)),
+        summaryOutputTokens,
         requestOverheadTokens: this.requestTokens([]),
-        droppedCount: droppedCount === 0 ? undefined : droppedCount,
-        wireLines,
+        droppedCount: dropped,
+      }, {
+        text: (text) => this.tokenCounting.estimateText(text),
+        message: (message) => this.tokenCounting.estimateMessage(message),
+        messages: (messages) => this.tokenCounting.estimateMessages(messages),
       });
+      void this.dispatcher.dispatch(new ContextApplyCompaction({
+        agentId: this.agent.agentId,
+        summary: compacted.summary,
+        contextSummary: compacted.contextSummary,
+        compactedCount: compacted.compactedCount,
+        tokensBefore: compacted.tokensBefore,
+        tokensAfter: compacted.tokensAfter,
+        summaryOutputTokens,
+        keptUserMessageCount: compacted.keptUserMessageCount,
+        keptHeadUserMessageCount: compacted.keptHeadUserMessageCount,
+        droppedCount: dropped,
+        wireLines,
+      }));
+      if (!this.loopService.replaceHistory(historyFromContext(compacted.messages), 'compaction')) {
+        throw new Error2(ErrorCodes.INTERNAL, 'Loop rejected compacted history');
+      }
+      this.tokenCounting.rebase(this.agent.agentContext, {
+        length: compacted.messages.length,
+        tokens: compacted.tokensAfter,
+        measured: false,
+      });
+      const { messages: _messages, ...result } = compacted;
+      void _messages;
 
       const properties: CompactionFinishedEvent = {
         turn_id: active.originTurnId,

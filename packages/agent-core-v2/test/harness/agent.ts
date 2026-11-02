@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { appendContext } from '../agent/contextMemory/stubs';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { Readable, type Writable } from 'node:stream';
 
@@ -53,9 +54,9 @@ import type {
 import type { AgentCommandInfo } from '#/agent/command/agentCommand';
 import { IAgentCommandService } from '#/agent/command/agentCommand';
 import type { AgentContextData } from '#/agent/contextMemory/types';
+import { ContextClear } from '#/agent/contextMemory/contextEvents';
 import type { CreateGoalInput, GoalSnapshot, GoalToolResult } from '#/features/goal/types';
 import { IAgentConversationUndoService } from '#/agent/undo/undo';
-import { IAgentLoopService } from '#/agent/loop/loop';
 import type { RunShellCommandInput, RunShellCommandResult } from '#/agent/shellCommand/shellCommand';
 import type { ProfileSetModelResult } from '#/agent/profile/profile';
 import type { SwarmModeTrigger } from '#/features/swarm/agent/swarm';
@@ -147,7 +148,7 @@ import {
   BlobStoreService,
   IBootstrapService,
   IConfigService,
-  IAgentContextMemoryService,
+  IAgentLoopService,
   IAgentExternalHooksService,
   IExternalHooksRunnerService,
   IAgentFullCompactionService,
@@ -1443,7 +1444,7 @@ export class AgentTestContext {
     };
     loop.requester = new PromptCacheGuardedLoopRequester(
       loop.requester,
-      this.agent.accessor.get(IAgentContextMemoryService),
+      this.agent.accessor.get(IAgentLoopService),
     );
     adoptAgent!();
     this.installInteractionBridge();
@@ -1477,8 +1478,8 @@ export class AgentTestContext {
     return this.session.accessor.get(IModelCatalog);
   }
 
-  get context(): IAgentContextMemoryService {
-    return this.get(IAgentContextMemoryService);
+  get context(): IAgentLoopService {
+    return this.get(IAgentLoopService);
   }
 
   get tokenCounting() {
@@ -1653,7 +1654,7 @@ export class AgentTestContext {
   }
 
   private initializeRestorableServices(): void {
-    const context = this.get(IAgentContextMemoryService);
+    const context = this.get(IAgentLoopService);
     const tokenCounting = this.tokenCounting;
     const usage = this.usage;
     const permissionMode = this.get(IAgentPermissionModeService);
@@ -1667,7 +1668,7 @@ export class AgentTestContext {
     const permission = this.get(IAgentPermissionGate);
     const swarm = this.get(IAgentSwarmService);
 
-    context.get();
+    context.history();
     void swarm.isActive;
     tokenCounting.get();
     usage.status();
@@ -1730,16 +1731,16 @@ export class AgentTestContext {
   }
 
   contextData(): { readonly history: readonly ContextMessage[]; readonly tokenCount: number } {
-    const context = this.get(IAgentContextMemoryService);
+    const context = this.get(IAgentLoopService);
     const tokenCounting = this.tokenCounting;
     return {
-      history: context.get(),
+      history: context.history(),
       tokenCount: tokenCounting.get().measured,
     };
   }
 
   project(messages?: readonly ContextMessage[]) {
-    return projectContext(messages ?? this.get(IAgentContextMemoryService).get());
+    return projectContext(messages ?? this.get(IAgentLoopService).history());
   }
 
   toolsData(): Array<
@@ -1802,7 +1803,8 @@ export class AgentTestContext {
 
   clearContext(): void {
     drainPrompts(this.get(IAgentLoopService));
-    this.get(IAgentContextMemoryService).clear();
+    void this.dispatcher.dispatch(new ContextClear({ agentId: 'main' }));
+    this.get(IAgentLoopService).replaceHistory([], 'clear');
   }
 
   async undoHistory(count: number): Promise<number> {
@@ -2012,8 +2014,8 @@ export class AgentTestContext {
   }
 
   compactHistory(): Array<{ readonly role: string; readonly text: string }> {
-    const context = this.get(IAgentContextMemoryService);
-    return context.get().map((message) => ({
+    const context = this.get(IAgentLoopService);
+    return context.history().map((message) => ({
       role: message.role,
       text: message.content.map((part) => (part.type === 'text' ? part.text : '')).join(''),
     }));
@@ -2230,7 +2232,7 @@ export class AgentTestContext {
       listCommands: () => this.get(IAgentCommandService).list(),
       runCommand: (payload) => this.get(IAgentCommandService).run(payload.name, payload.args),
       getContext: () => ({
-        history: this.get(IAgentContextMemoryService).get(),
+        history: this.get(IAgentLoopService).history(),
         tokenCount: this.tokenCounting.statusSize(),
       }),
       getTools: () => this.toolsData(),
@@ -2267,7 +2269,8 @@ export class AgentTestContext {
       detachTask: (payload) => this.get(IAgentTaskService).detach(payload.taskId),
       clearContext: () => {
         drainPrompts(this.get(IAgentLoopService));
-        this.get(IAgentContextMemoryService).clear();
+        void this.dispatcher.dispatch(new ContextClear({ agentId: 'main' }));
+        this.get(IAgentLoopService).replaceHistory([], 'clear');
       },
       createGoal: (payload) => this.get(IAgentGoalService).createGoal(payload),
       getGoal: () => this.get(IAgentGoalService).getGoal(),
@@ -2308,8 +2311,8 @@ export class AgentTestContext {
 
   private appendMessage(...messages: ContextMessage[]): void {
     if (messages.length === 0) return;
-    const context = this.get(IAgentContextMemoryService);
-    context.append(...messages);
+    const context = this.get(IAgentLoopService);
+    appendContext(context,...messages);
   }
 
   private coverUsage(tokenTotal: number | undefined): void {
@@ -2320,13 +2323,13 @@ export class AgentTestContext {
       inputCacheRead: 0,
       inputCacheCreation: 0,
     };
-    const context = this.get(IAgentContextMemoryService);
+    const context = this.get(IAgentLoopService);
     const tokenCounting = this.tokenCounting;
-    tokenCounting.measured(context.get(), [], usage);
+    tokenCounting.measured(context.history(), [], usage);
     const profile = this.get(IAgentProfileService);
     void this.usage.record(profile.data().modelAlias ?? 'mock-model', usage, {
       type: 'turn',
-      turnId: context.get().length,
+      turnId: context.history().length,
     });
   }
 }
@@ -2861,13 +2864,26 @@ function cloneRecord<T extends WireRecord>(event: T): T {
 
 function withMetadata(events: readonly WireRecord[]): readonly WireRecord[] {
   if (events.length === 0 || events[0]?.type === 'metadata') return events;
+  const shifted = events.map((event) => {
+    if (event.type !== 'agent.switched') return event;
+    const base = event['base'];
+    if (base === null || typeof base !== 'object' || Array.isArray(base)) return event;
+    const line = (base as { line?: unknown }).line;
+    if (typeof line !== 'number') return event;
+    const legacyUndoLine = event['legacyUndoLine'];
+    return {
+      ...event,
+      base: { ...base, line: line + 1 },
+      legacyUndoLine: typeof legacyUndoLine === 'number' ? legacyUndoLine + 1 : undefined,
+    };
+  });
   return [
     {
       type: 'metadata',
       protocol_version: WIRE_PROTOCOL_VERSION,
       created_at: 1,
     },
-    ...events,
+    ...shifted,
   ];
 }
 

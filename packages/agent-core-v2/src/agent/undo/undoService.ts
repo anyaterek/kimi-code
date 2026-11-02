@@ -6,7 +6,6 @@ import { BugIndicatingError } from '#/_base/errors/errors';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/_base/log/log';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { IAgentConversationUndoParticipantRegistry } from '#/agent/contextMemory/conversationUndoParticipants';
 import {
   computeUndoCut,
@@ -20,6 +19,7 @@ import {
 import { IAgentFullCompactionService } from '#/agent/fullCompaction/fullCompaction';
 import { isUserPromptSubmitHookPart } from '#/agent/contextMemory/hookParts';
 import { IAgentLoopService } from '#/agent/loop/loop';
+import { AgentLoopService } from '#/agent/loop/loopService';
 import { turnKey } from '#/agent/loop/turnOps';
 import { promptMetadataTextFromContentParts } from '#/agent/prompt/promptMetadataText';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
@@ -62,9 +62,9 @@ export class AgentConversationUndoService
   private undoQueue: Promise<void> = Promise.resolve();
 
   constructor(
-    @IAgentLoopService private readonly loop: IAgentLoopService,
+    @IAgentLoopService private readonly loop: AgentLoopService,
     @IAgentFullCompactionService private readonly fullCompaction: IAgentFullCompactionService,
-    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
+    @IAgentLoopService private readonly context: IAgentLoopService,
     @IAgentConversationUndoParticipantRegistry
     private readonly participants: IAgentConversationUndoParticipantRegistry,
     @IAgentScopeContext private readonly agentCtx: IAgentScopeContext,
@@ -83,7 +83,7 @@ export class AgentConversationUndoService
   }
 
   availability(): UndoAvailability {
-    const cut = computeUndoCut(this.context.get(), Number.MAX_SAFE_INTEGER);
+    const cut = computeUndoCut(this.context.history(), Number.MAX_SAFE_INTEGER);
     return {
       maxTurns: cut.removedCount,
       stoppedAtCompaction: cut.stoppedAtCompaction,
@@ -135,14 +135,15 @@ export class AgentConversationUndoService
         this.log.warn('undo state restore failed; retrying once', { error });
         await this.dispatcher.restore();
       }
-      await this.loop.resetMachineEngine();
+      await this.loop.resetLoop();
       this.tokenCounting.recordTruncation(
         this.agentCtx.agentContext,
-        this.context.get().length,
+        this.context.history().length,
       );
       await this.reconcileParticipants();
       await this.flushAfterReconcile();
       await this.reconcileParticipants('after-flush');
+      this.loop.flushReminders();
       await this.reconcileLastPromptSafely();
       this.telemetry.track2('conversation_undo', { count: turns });
       await this.dispatcher.dispatch(
@@ -178,7 +179,7 @@ export class AgentConversationUndoService
     if (!this.agentState.has(turnKey)) return undefined;
     const anchorTurnIds = this.agentState.get(turnKey).anchorTurnIds;
     if (anchorTurnIds.length < turns) return undefined;
-    const totalAnchors = computeUndoCut(this.context.get(), Number.MAX_SAFE_INTEGER).removedCount;
+    const totalAnchors = computeUndoCut(this.context.history(), Number.MAX_SAFE_INTEGER).removedCount;
     if (totalAnchors !== anchorTurnIds.length) return undefined;
     return anchorTurnIds[anchorTurnIds.length - turns];
   }
@@ -191,7 +192,7 @@ export class AgentConversationUndoService
   }
 
   private assertUndoAvailable(turns: number): void {
-    const check = precheckUndo(this.context.get(), turns);
+    const check = precheckUndo(this.context.history(), turns);
     if (check.ok) return;
     throw new Error2(
       ErrorCodes.SESSION_UNDO_UNAVAILABLE,
@@ -247,7 +248,7 @@ export class AgentConversationUndoService
       ? undefined
       : promptMetadataTextFromContentParts(pending.message.content.filter((part) => !isUserPromptSubmitHookPart(part)), (pending.meta?.origin as UserPromptOrigin | undefined)?.clientMetadata);
     if (lastPrompt === undefined) {
-      const history = this.context.get();
+      const history = this.context.history();
       for (let i = history.length - 1; i >= 0; i--) {
         const message = history[i]!;
         if (!isUndoAnchor(message)) continue;

@@ -1,22 +1,36 @@
 import type { ServiceRegistration } from '#/_base/di/test';
-import { buildContextCompactionShape } from '#/agent/contextMemory/compactionHandoff';
-import {
-  IAgentContextMemoryService,
-  type ContextCompactionInput,
-  type ContextCompactionResult,
-} from '#/agent/contextMemory/contextMemory';
+import { buildContextCompactionShape, type ContextCompactionShape, type ContextCompactionShapeInput } from '#/agent/contextMemory/compactionHandoff';
 import { computeUndoCut, type UndoCut } from '#/agent/contextMemory/contextOps';
 import { ContextSpliced } from '#/agent/contextMemory/contextEvents';
-import type { LoopRecordedEvent } from '#/agent/contextMemory/loopEventFold';
 import type { ContextMessage } from '#/agent/contextMemory/types';
+import { contextFromHistoryEntry, historyFromContext } from '#/agent/loop/history';
+import { IAgentLoopService } from '#/agent/loop/loop';
 import { IEventBus, type ISessionEventBus } from '#/app/event/eventBus';
 import { EventBusService } from '#/app/event/eventBusService';
 import { IWireService } from '#/wire/wire';
+import type { HistoryMessage } from '#human/agent/turn';
 
 import { stubAgentWire } from '../../wire/stubs';
 import { stubAgentContext } from '../agentContext/stubs';
+import { stubLoopWithHooks, type StubLoop } from '../loop/stubs';
 
-export interface StubContextMemory extends IAgentContextMemoryService {
+export function appendContext(loop: IAgentLoopService, ...messages: readonly ContextMessage[]): void {
+  loop.remind(...historyFromContext(messages));
+  loop.flushReminders();
+}
+
+export function compactContext(
+  loop: IAgentLoopService,
+  input: ContextCompactionShapeInput,
+): Omit<ContextCompactionShape, 'messages'> {
+  const shape = buildContextCompactionShape(loop.history(), input);
+  loop.replaceHistory(historyFromContext(shape.messages), 'compaction');
+  const { messages: _messages, ...result } = shape;
+  void _messages;
+  return result;
+}
+
+export interface StubContextMemory extends StubLoop {
   readonly messages: readonly ContextMessage[];
   undo(count: number): UndoCut;
 }
@@ -44,26 +58,31 @@ function publishSplice(
 export function stubContextMemory(eventBus?: IEventBus): StubContextMemory {
   const messages: ContextMessage[] = [];
   let revision = 0;
+  const base = stubLoopWithHooks();
+  const replaceHistory = (entries: readonly HistoryMessage[]): boolean => {
+    const previousLength = messages.length;
+    const next = entries.map((entry) => contextFromHistoryEntry(entry));
+    messages.splice(0, messages.length, ...next);
+    revision += 1;
+    publishSplice(eventBus, { start: 0, deleteCount: previousLength, messages: [...next] });
+    return true;
+  };
   return {
-    _serviceBrand: undefined,
+    ...base,
     get messages() {
       return messages;
     },
-    get: () => [...messages],
-    prefixRevision: () => revision,
-    append: (...inserted) => {
-      const start = messages.length;
-      messages.push(...inserted);
-      publishSplice(eventBus, { start, deleteCount: 0, messages: [...inserted] });
+    history: () => messages,
+    historyRevision: () => revision,
+    replaceHistory,
+    initializeHistory: async (entries) => {
+      replaceHistory(entries);
     },
-    appendLoopEvent: () => {},
-    publishTrailingRemoval: () => false,
-    clear: () => {
-      const deleteCount = messages.length;
-      if (deleteCount === 0) return;
-      messages.splice(0, deleteCount);
-      revision += 1;
-      publishSplice(eventBus, { start: 0, deleteCount, messages: [] });
+    remind: (...entries) => {
+      const start = messages.length;
+      const inserted = entries.map((entry) => contextFromHistoryEntry(entry));
+      messages.push(...inserted);
+      publishSplice(eventBus, { start, deleteCount: 0, messages: inserted });
     },
     undo: (count) => {
       const cut = computeUndoCut(messages, count);
@@ -75,58 +94,11 @@ export function stubContextMemory(eventBus?: IEventBus): StubContextMemory {
       }
       return cut;
     },
-    applyCompaction: (input: ContextCompactionInput): ContextCompactionResult => {
-      const shape = buildContextCompactionShape(messages, input);
-      const previousLength = messages.length;
-      messages.splice(0, previousLength, ...shape.messages);
-      if (previousLength > 0) revision += 1;
-      publishSplice(eventBus, {
-        start: 0,
-        deleteCount: previousLength,
-        messages: [...shape.messages],
-        tokens: shape.tokensAfter,
-      });
-      const { messages: _messages, ...result } = shape;
-      void _messages;
-      return result;
-    },
   };
-}
-
-class StubContextMemoryService implements IAgentContextMemoryService {
-  declare readonly _serviceBrand: undefined;
-  private readonly impl: StubContextMemory;
-  constructor(@IEventBus eventBus: IEventBus) {
-    this.impl = stubContextMemory(eventBus);
-  }
-  get messages(): readonly ContextMessage[] {
-    return this.impl.messages;
-  }
-  get(): readonly ContextMessage[] {
-    return this.impl.get();
-  }
-  append(...messages: readonly ContextMessage[]): void {
-    this.impl.append(...messages);
-  }
-  clear(): void {
-    this.impl.clear();
-  }
-  appendLoopEvent(event: LoopRecordedEvent): void {
-    this.impl.appendLoopEvent(event);
-  }
-  publishTrailingRemoval(previous: readonly ContextMessage[]): boolean {
-    return this.impl.publishTrailingRemoval(previous);
-  }
-  applyCompaction(input: ContextCompactionInput): ContextCompactionResult {
-    return this.impl.applyCompaction(input);
-  }
-  prefixRevision(): number {
-    return this.impl.prefixRevision();
-  }
 }
 
 export function registerContextMemoryServices(reg: ServiceRegistration): void {
   reg.defineInstance(IWireService, stubAgentWire());
   reg.define(IEventBus, EventBusService);
-  reg.define(IAgentContextMemoryService, StubContextMemoryService);
+  reg.defineInstance(IAgentLoopService, stubContextMemory());
 }

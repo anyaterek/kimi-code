@@ -95,7 +95,8 @@ export function mergeSteerMessages(messages: readonly SteerMessage[]): {
     return metadata !== undefined && metadata.length > 0 ? metadata : [{ display_text: promptDisplayTextFromContentParts(stripBundledSkillBlocks(message)) }];
   }) : [];
   const skillActivations = messages.flatMap(
-    (message) => userOriginOf(message.origin)?.skillActivations ?? [],
+    (message) => userOriginOf(message.origin)?.skillActivations ?? [],   
+    
   );
   const attachments = messages.flatMap((message) => userOriginOf(message.origin)?.attachments ?? []);
   return {

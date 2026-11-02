@@ -6,16 +6,22 @@ import type { FinishReason } from '#human/llm-requester/finish-reason';
 import type { ContentPart, TextPart } from '#human/llm/message';
 import type { TokenUsage } from '#human/llm-requester/usage';
 import type { Hooks } from '#/hooks';
-import type { UserEntry } from '#human/agent/turn';
+import type { HistoryMessage, UserEntry } from '#human/agent/turn';
 import type { LoopRequester } from './requesterContract';
 import { LoopErrors } from './errors';
-import type {
-  MachineEngine,
-  MachineEngineAttachBundle,
-  MachineEngineAttachRef,
-  MachineEngineRetrySnapshot,
-  MachineEngineToolCallSnapshot,
-} from './machine/engine';
+export interface AgentActivityRetrySnapshot {
+  readonly failedAttempt: number;
+  readonly nextAttempt: number;
+  readonly maxAttempts: number;
+  readonly delayMs: number;
+  readonly errorName?: string;
+  readonly statusCode?: number;
+}
+
+export interface AgentActivityToolCallSnapshot {
+  readonly toolCallId: string;
+  readonly name: string;
+}
 
 export interface AgentActivityTurnSnapshot {
   readonly turnId: number;
@@ -23,8 +29,8 @@ export interface AgentActivityTurnSnapshot {
   readonly step: number;
   readonly ending: boolean;
   readonly endingReason?: 'aborted';
-  readonly retry?: MachineEngineRetrySnapshot;
-  readonly activeToolCalls: readonly MachineEngineToolCallSnapshot[];
+  readonly retry?: AgentActivityRetrySnapshot;
+  readonly activeToolCalls: readonly AgentActivityToolCallSnapshot[];
   readonly since?: number;
 }
 
@@ -208,6 +214,14 @@ export interface IAgentLoopService {
 
   readonly requester: LoopRequester;
 
+  history(): readonly ContextMessage[];
+
+  historyRevision(): number;
+
+  replaceHistory(messages: readonly HistoryMessage[], reason?: string): boolean;
+
+  initializeHistory(messages: readonly HistoryMessage[]): Promise<void>;
+
   submit(input: UserEntry, options?: LoopSubmitOptions): LoopSubmitResult;
 
   steer(promptIds: readonly string[]): Promise<void>;
@@ -218,19 +232,17 @@ export interface IAgentLoopService {
 
   settled(): Promise<void>;
 
+  close(): Promise<void>;
+
   tryAcquireQuiescence(): IDisposable | undefined;
 
   tryAcquireHistorySnapshot(): IDisposable | undefined;
 
   notify(note?: LoopNotify): LoopNotifyHandle;
 
-  remind(note?: LoopNotify): LoopNotifyHandle;
+  remind(...entries: readonly HistoryMessage[]): void;
 
-  buildAttachBundle(): MachineEngineAttachBundle;
-
-  attachEngine(ref: MachineEngineAttachRef, bundle: MachineEngineAttachBundle): MachineEngine;
-
-  resetMachineEngine(): Promise<void>;
+  flushReminders(): void;
 
   promptHandle(id: string): PromptHandle | undefined;
 

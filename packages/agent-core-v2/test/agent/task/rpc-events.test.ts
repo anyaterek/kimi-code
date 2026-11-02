@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises';
+import { appendContext } from '../contextMemory/stubs';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import type { Writable } from 'node:stream';
@@ -21,7 +22,6 @@ import {
 } from '#/agent/tools/agent/subagent-task';
 import { ProcessTask } from '#/agent/tools/os/bash/process-task';
 import { QuestionBackgroundTask } from '#/agent/tools/ask-user-question/question-background-task';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { IEventBus } from '#/app/event/eventBus';
 import type { IExternalHooksRunnerService } from '#/features/externalHooks/app/externalHooksRunner';
 import { IAgentLoopService } from '#/agent/loop/loop';
@@ -212,8 +212,8 @@ function createAgentTaskService(options: {
     emittedEvents.push(event as { type: string; info?: unknown });
   });
 
-  const context = ctx.get(IAgentContextMemoryService);
-  const appendHistorySpy = vi.spyOn(context, 'append');
+  const context = ctx.get(IAgentLoopService);
+  const appendHistorySpy = vi.spyOn(context, 'replaceHistory');
 
   const agent: FakeTaskAgent = {
     emittedEvents,
@@ -969,8 +969,8 @@ describe('AgentTaskService — notification delivery', () => {
       await persistence.appendTaskOutput('agent-seen0000', 'already delivered summary');
       fixture = createAgentTaskService({ sessionDir });
       const { agent, ctx, manager } = fixture;
-      const context = ctx.get(IAgentContextMemoryService);
-      context.append(
+      const context = ctx.get(IAgentLoopService);
+      appendContext(context,
         {
           role: 'user',
           content: [{ type: 'text', text: 'already delivered' }],
@@ -1014,9 +1014,9 @@ describe('AgentTaskService — notification delivery', () => {
       await ctx.get(IAgentConversationUndoService).undo(1);
 
       expect(agent.context.appendUserMessage).toHaveBeenCalledTimes(2);
-      expect(ctx.context.get().some((message) => message.origin?.kind === 'user')).toBe(false);
+      expect(ctx.context.history().some((message) => message.origin?.kind === 'user')).toBe(false);
       expect(
-        ctx.context.get().filter((message) => message.origin?.kind === 'task'),
+        ctx.context.history().filter((message) => message.origin?.kind === 'task'),
       ).toHaveLength(1);
     } finally {
       await cleanupSessionDir(sessionDir, fixture);
@@ -1061,7 +1061,7 @@ describe('AgentTaskService — notification delivery', () => {
       });
       expect(active.signal.aborted).toBe(false);
       expect(
-        ctx.context.get().filter((message) => message.origin?.kind === 'task'),
+        ctx.context.history().filter((message) => message.origin?.kind === 'task'),
       ).toEqual([]);
 
       ctx.mockNextResponse({ type: 'text', text: 'notification acknowledged' });
@@ -1069,7 +1069,7 @@ describe('AgentTaskService — notification delivery', () => {
       release();
       await expect(active.result).resolves.toMatchObject({ type: 'completed' });
       expect(
-        ctx.context.get().filter((message) => message.origin?.kind === 'task'),
+        ctx.context.history().filter((message) => message.origin?.kind === 'task'),
       ).toEqual([
         expect.objectContaining({
           origin: expect.objectContaining({ taskId, status: 'completed' }),
@@ -1185,7 +1185,7 @@ describe('AgentTaskService — notification delivery', () => {
       );
       fixture = createAgentTaskService({ sessionDir });
       const { agent, ctx, manager } = fixture;
-      ctx.get(IAgentContextMemoryService).append({
+      appendContext(ctx.get(IAgentLoopService),{
         role: 'user',
         content: [{ type: 'text', text: '<notification>interrupted task lost.</notification>' }],
         origin: {

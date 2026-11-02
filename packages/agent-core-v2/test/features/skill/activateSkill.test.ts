@@ -105,7 +105,7 @@ describe('promptWithSkills', () => {
     expect(llmInput).toContain('# Security body');
     expect(llmInput).toContain('Review this change.');
 
-    const messages = ctx.context.get();
+    const messages = ctx.context.history();
     const promptMessage = messages.find((message) => message.origin?.kind === 'user');
     expect(messages.filter((message) => message.origin?.kind === 'skill_activation')).toHaveLength(
       0,
@@ -169,7 +169,7 @@ describe('promptWithSkills', () => {
     expect(llmInput).toContain('/review src/app.ts');
 
     const bundled = ctx.context
-      .get()
+      .history()
       .find(
         (message) =>
           message.origin?.kind === 'user' && message.origin.skillActivations !== undefined,
@@ -263,7 +263,7 @@ describe('promptWithSkills', () => {
     ).rejects.toThrow(/not found/i);
 
     expect(ctx.llmCalls).toHaveLength(0);
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
     expect(
       ctx.allEvents.some((event) => event.type === '[rpc]' && event.event === 'skill.activated'),
     ).toBe(false);
@@ -280,7 +280,7 @@ describe('promptWithSkills', () => {
     ).rejects.toThrow(/non-empty prompt/i);
 
     expect(ctx.llmCalls).toHaveLength(0);
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
     expect(
       ctx.allEvents.some((event) => event.type === '[rpc]' && event.event === 'skill.activated'),
     ).toBe(false);
@@ -297,7 +297,7 @@ describe('promptWithSkills', () => {
     ).rejects.toThrow(/at least one skill/i);
 
     expect(ctx.llmCalls).toHaveLength(0);
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
     expect(
       ctx.allEvents.some((event) => event.type === '[rpc]' && event.event === 'skill.activated'),
     ).toBe(false);
@@ -312,11 +312,11 @@ describe('promptWithSkills', () => {
       skills: [{ name: 'review' }, { name: 'security' }],
     });
     await ctx.untilTurnEnd();
-    expect(ctx.context.get().length).toBeGreaterThan(0);
+    expect(ctx.context.history().length).toBeGreaterThan(0);
 
     const undone = await ctx.rpc.undoHistory({ count: 1 });
     expect(undone).toBe(1);
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
   });
 
   it('accepts later prompt_id reuse of a bundled prompt id as a pure correlation id', async () => {

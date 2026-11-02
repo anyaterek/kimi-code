@@ -103,13 +103,13 @@ describe('Agent resume', () => {
     try {
       await ctx.restorePersisted();
 
-      expect(ctx.context.get()).not.toContainEqual(
+      expect(ctx.context.history()).not.toContainEqual(
         expect.objectContaining({ origin: { kind: 'injection', variant: 'interruption' } }),
       );
       ctx.mockNextResponse({ type: 'text', text: 'Fresh response after resume.' });
       await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Fresh prompt after resume' }] });
       await ctx.untilTurnEnd();
-      expect(ctx.context.get()).not.toContainEqual(
+      expect(ctx.context.history()).not.toContainEqual(
         expect.objectContaining({
           role: 'user',
           origin: { kind: 'injection', variant: 'interruption' },
@@ -244,7 +244,7 @@ describe('Agent resume', () => {
       await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Fresh prompt after resume' }] });
       await ctx.untilTurnEnd();
 
-      expect(ctx.context.get()).not.toContainEqual(
+      expect(ctx.context.history()).not.toContainEqual(
         expect.objectContaining({ origin: { kind: 'injection', variant: 'interruption' } }),
       );
     } finally {
@@ -439,10 +439,19 @@ describe('Agent resume', () => {
         event: { type: 'step.end', uuid: 'historical-step', turnId: '0' },
       },
       { type: 'turn.cancel', turnId: 1, target: 'queued' },
+      { type: 'agent.turn.started', turnId: 99, queueItemId: 'ignored' },
+      {
+        type: 'agent.message.appended',
+        message: {
+          message: { role: 'user', content: [{ type: 'text', text: 'ignored agent history' }] },
+          meta: {},
+        },
+      },
     ] as WireRecord[]);
     const ctx = testAgent({ persistence, autoConfigure: false });
 
     await ctx.restorePersisted();
+    expect(JSON.stringify(ctx.context.history())).not.toContain('ignored agent history');
     ctx.mockNextResponse({ type: 'text', text: 'Fresh response.' });
     await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Fresh prompt' }] });
     await ctx.untilTurnEnd();
@@ -505,7 +514,7 @@ describe('Agent resume', () => {
 
     await ctx.restorePersisted();
 
-    expect(ctx.context.get().map((message) => message.role)).toEqual([
+    expect(ctx.context.history().map((message) => message.role)).toEqual([
       'user',
       'assistant',
       'user',
@@ -529,14 +538,14 @@ describe('Agent resume', () => {
 
     await ctx.restorePersisted();
 
-    expect(ctx.context.get().map((message) => message.role)).toEqual([
+    expect(ctx.context.history().map((message) => message.role)).toEqual([
       'user',
       'assistant',
       'tool',
       'tool',
       'user',
     ]);
-    expect(ctx.context.get()[4]?.content).toEqual([
+    expect(ctx.context.history()[4]?.content).toEqual([
       {
         type: 'text',
         text: '<system-reminder>\nresume skill body\n</system-reminder>',
@@ -594,7 +603,7 @@ describe('Agent resume', () => {
 
     await ctx.restorePersisted();
 
-    const message = ctx.context.get()[0];
+    const message = ctx.context.history()[0];
     if (message?.role !== 'assistant') throw new Error('expected assistant message');
     const toolCall = message.toolCalls[0] as
       | { name?: string; arguments?: string | null; function?: unknown }
@@ -656,7 +665,7 @@ describe('Agent resume', () => {
 
       await ctx.restorePersisted();
       expect(
-        ctx.context.get().some((message) => message.origin?.kind === 'task'),
+        ctx.context.history().some((message) => message.origin?.kind === 'task'),
       ).toBe(false);
 
       const background = ctx.get(IAgentTaskService) as TaskServiceTestManager;
@@ -705,7 +714,7 @@ describe('Agent resume', () => {
 
     await ctx.restorePersisted();
 
-    expect(ctx.context.get()).toEqual([
+    expect(ctx.context.history()).toEqual([
       expect.objectContaining({
         role: 'user',
         content: [{ type: 'text', text: 'Compacted implementation notes.' }],
@@ -729,9 +738,9 @@ describe('Agent resume', () => {
       },
     ] as unknown as WireRecord[]);
     const homeDir = await mkdtemp(join(tmpdir(), 'kimi-bg-resume-undelivered-'));
+    const ctx = testAgent(homeDirServices(homeDir), { autoConfigure: false, persistence });
     try {
       const backgroundPersistence = createAgentTaskPersistence(homeDir);
-      const ctx = testAgent(homeDirServices(homeDir), { autoConfigure: false, persistence });
       await backgroundPersistence.writeTask({
         taskId: 'agent-new00000',
         kind: 'agent',
@@ -746,8 +755,11 @@ describe('Agent resume', () => {
       await ctx.restorePersisted();
 
       expect(steer).not.toHaveBeenCalled();
+      ctx.mockNextResponse({ type: 'text', text: 'Fresh response.' });
+      await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Fresh prompt' }] });
+      await ctx.untilTurnEnd();
       expect(
-        ctx.context.get().some(
+        ctx.context.history().some(
           (message) =>
             message.origin?.kind === 'task' &&
             message.origin.taskId === 'agent-new00000',
@@ -767,6 +779,7 @@ describe('Agent resume', () => {
         }),
       );
     } finally {
+      await ctx.dispose();
       await rm(homeDir, { recursive: true, force: true });
     }
   });
@@ -810,7 +823,7 @@ describe('Agent resume', () => {
 
     await ctx.restorePersisted();
 
-    expect(ctx.context.get().map((message) => message.role)).toEqual([
+    expect(ctx.context.history().map((message) => message.role)).toEqual([
       'user',
       'assistant',
       'tool',
@@ -846,7 +859,7 @@ describe('Agent resume', () => {
 
     await ctx.restorePersisted();
 
-    expect(ctx.context.get()).toHaveLength(0);
+    expect(ctx.context.history()).toHaveLength(0);
   });
 
   it('restores an envelope-less active goal without charging offline time', async () => {
@@ -1090,10 +1103,10 @@ describe('Agent resume', () => {
     try {
       await ctx.restorePersisted();
 
-      expect(ctx.context.get()).toHaveLength(3);
-      expect(ctx.context.get()[0]?.role).toBe('user');
-      expect(ctx.context.get()[1]?.role).toBe('assistant');
-      expect(ctx.context.get()[2]?.role).toBe('user');
+      expect(ctx.context.history()).toHaveLength(3);
+      expect(ctx.context.history()[0]?.role).toBe('user');
+      expect(ctx.context.history()[1]?.role).toBe('assistant');
+      expect(ctx.context.history()[2]?.role).toBe('user');
       const skipped = unexpected.filter(
         (error) => (error as { code?: unknown }).code === 'wire.unknown_record',
       );
@@ -1131,7 +1144,7 @@ describe('Agent resume', () => {
     try {
       await ctx.restorePersisted();
 
-      expect(ctx.context.get()).toHaveLength(1);
+      expect(ctx.context.history()).toHaveLength(1);
       await expect(ctx.get(IAgentPlanService).status()).resolves.toBeNull();
       const malformed = unexpected.filter((error) =>
         String((error as Error).message).includes('Malformed wire record'),

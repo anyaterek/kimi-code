@@ -896,7 +896,9 @@ export async function buildWireManifest(): Promise<string> {
     WIRE_PROTOCOL_VERSION: string;
   };
 
-  const entries = [...EVENT2_REGISTRY.values()].toSorted((a, b) => a.type.localeCompare(b.type));
+  const entries = [...EVENT2_REGISTRY.values()]
+    .filter((cls) => cls.durable)
+    .toSorted((a, b) => a.type.localeCompare(b.type));
   const migrationChain = scanMigrationChain();
 
   const folding = new Map<string, { states: string[]; blobs: string[] }>();

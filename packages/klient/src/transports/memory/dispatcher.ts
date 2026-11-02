@@ -265,6 +265,7 @@ function agentSkillServiceView(agent: IAgentScopeHandle): Record<string, unknown
 function agentLoopServiceView(agent: IAgentScopeHandle): Record<string, unknown> {
   const loop = agent.accessor.get(IAgentLoopService);
   return {
+    get: () => loop.history(),
     cancelFromUser: (turnId?: number) => {
       const snapshot = loop.snapshot();
       if (snapshot.state === 'running') {

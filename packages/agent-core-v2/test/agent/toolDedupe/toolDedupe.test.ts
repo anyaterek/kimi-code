@@ -723,7 +723,7 @@ describe('AgentToolDedupeService', () => {
     }
 
     function drainHandoff(h: Harness): string | undefined {
-      return h.loop.drainNextBatch({ append: () => {} })?.driver.kind;
+      return h.loop.drainNextBatch()?.driver.kind;
     }
 
     it('tags the force-stop result with the repeat_breaker stop reason', async () => {

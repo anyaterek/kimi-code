@@ -1,6 +1,7 @@
 import { Service } from '#/_base/di/service';
 import { IAgentReminderService } from '#/features/reminder/reminderService';
-import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
+import { IAgentLoopService } from '#/agent/loop/loop';
+import { historyFromContext } from '#/agent/loop/history';
 import { TurnEnded } from '#/agent/loop/turnOps';
 import { IAgentToolApprovalService } from '#/agent/toolApproval/toolApproval';
 import { denyToolExecution } from '#/agent/toolExecutor/beforeToolExecuteEvent';
@@ -24,7 +25,7 @@ export class AgentSwarmService extends Service implements IAgentSwarmService {
     @IEventDispatcher private readonly dispatcher: IEventDispatcher,
     @IAgentReminderService reminder: IAgentReminderService,
     @IEventBus eventBus: IEventBus,
-    @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
+    @IAgentLoopService private readonly context: IAgentLoopService,
     @IAgentToolApprovalService private readonly toolApproval: IAgentToolApprovalService,
     @IAgentToolExecutorService toolExecutor: IAgentToolExecutorService,
     @IAgentScopeContext private readonly agentCtx: IAgentScopeContext,
@@ -82,10 +83,10 @@ export class AgentSwarmService extends Service implements IAgentSwarmService {
   exit(): void {
     const trigger = this.agentState.get(swarmKey);
     if (trigger === null) return;
-    const history = this.context.get();
+    const history = this.context.history();
     void this.dispatcher.dispatch(new SwarmModeExit({ agentId: this.agentCtx.agentId }));
     this.telemetry.track2('swarm_mode_exited', { trigger });
-    this.context.publishTrailingRemoval(history);
+    this.context.replaceHistory(historyFromContext(history.slice(0, -1)), 'swarm_mode.exit');
   }
 
   get isActive(): boolean {
